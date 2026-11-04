@@ -1,7 +1,9 @@
 import AppKit
+import AudioToolbox
 import AVFoundation
 import Darwin
 import Foundation
+import ImageIO
 import MediaPlayer
 import os.lock
 import SwiftUI
@@ -68,7 +70,7 @@ struct DecoderCapabilities: Equatable, Sendable {
     var isBuiltInNative: Bool = false
 }
 
-enum DecoderStatus: Equatable {
+enum DecoderStatus: Equatable, Sendable {
     case readyAC4(source: String, path: String, versionLine: String, capabilities: DecoderCapabilities)
     case missingAC4Codec(path: String, versionLine: String, capabilities: DecoderCapabilities)
     case notFound(reason: String)
@@ -134,7 +136,7 @@ struct TrackMetadata {
     var hasArtwork: Bool = false
 }
 
-struct AudioTrack: Identifiable, Hashable {
+struct AudioTrack: Identifiable, Hashable, Sendable {
     let id: UUID
     let url: URL
     var title: String
@@ -822,6 +824,1583 @@ enum ArtworkLoader {
             }
         }
         return nil
+    }
+}
+
+// MARK: - Complete Metadata & Artwork Extractor + Lossless In-Place FLAC Exporter
+
+struct EmbeddedPicture: Sendable {
+    let data: Data
+    let mimeType: String
+    let pictureType: UInt32 // 3 = Cover (front), 0 = Other
+    let width: UInt32
+    let height: UInt32
+    let colorDepth: UInt32
+}
+
+struct RichMetadataBundle: Sendable {
+    private(set) var comments: [(key: String, value: String)] = []
+    private(set) var pictures: [EmbeddedPicture] = []
+    private var seenPairs: Set<String> = []
+    private var seenKeys: Set<String> = []
+
+    func hasKey(_ key: String) -> Bool {
+        seenKeys.contains(key.uppercased())
+    }
+
+    mutating func appendTag(key rawKey: String, value rawValue: String) {
+        guard let cleanKey = Self.sanitizeVorbisKey(rawKey),
+              let cleanVal = Self.cleanVorbisValue(rawValue) else {
+            return
+        }
+        let dedupToken = "\(cleanKey)\u{0}\(cleanVal)"
+        guard !seenPairs.contains(dedupToken) else { return }
+        seenPairs.insert(dedupToken)
+        seenKeys.insert(cleanKey)
+        comments.append((key: cleanKey, value: cleanVal))
+    }
+
+    mutating func appendPicture(data: Data, fallbackMime: String? = nil) {
+        // RFC 9639 metadata block payload max is 2^24 - 1 (16,777,215 bytes); keep safe margin for header
+        guard !data.isEmpty, data.count <= 16_777_000 else { return }
+        let mime = Self.detectImageMime(data: data, fallback: fallbackMime)
+        guard mime.utf8.count <= 128 else { return }
+
+        var width: UInt32 = 0
+        var height: UInt32 = 0
+        var colorDepth: UInt32 = 0
+
+        if let src = CGImageSourceCreateWithData(data as CFData, nil),
+           let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] {
+            let w = (props[kCGImagePropertyPixelWidth] as? Int) ?? 0
+            let h = (props[kCGImagePropertyPixelHeight] as? Int) ?? 0
+            if w > 0 && h > 0 {
+                width = UInt32(w)
+                height = UInt32(h)
+                let bpc = (props[kCGImagePropertyDepth] as? Int) ?? 8
+                let hasAlpha = (props[kCGImagePropertyHasAlpha] as? Bool) ?? false
+                let model = (props[kCGImagePropertyColorModel] as? String) ?? ""
+                let channels: Int
+                if model == (kCGImagePropertyColorModelGray as String) {
+                    channels = hasAlpha ? 2 : 1
+                } else {
+                    channels = hasAlpha ? 4 : 3
+                }
+                colorDepth = UInt32(max(1, min(64, bpc * channels)))
+            }
+        }
+
+        let picType: UInt32 = pictures.isEmpty ? 3 : 0
+        pictures.append(
+            EmbeddedPicture(
+                data: data,
+                mimeType: mime,
+                pictureType: picType,
+                width: width,
+                height: height,
+                colorDepth: colorDepth
+            )
+        )
+    }
+
+    /// RFC 9639 §8.6: Vorbis comment field names allow ASCII 0x20...0x7D excluding 0x3D ('=').
+    static func sanitizeVorbisKey(_ raw: String) -> String? {
+        var chars: [Character] = []
+        chars.reserveCapacity(raw.count)
+        var prevSpace = true
+        for scalar in raw.unicodeScalars {
+            let v = scalar.value
+            if v == 0x3D { // '='
+                if !prevSpace {
+                    chars.append("_")
+                    prevSpace = false
+                }
+            } else if v >= 0x61 && v <= 0x7A { // a-z -> A-Z
+                chars.append(Character(UnicodeScalar(v - 32)!))
+                prevSpace = false
+            } else if v == 0x20 || v == 0x09 {
+                if !prevSpace {
+                    chars.append(" ")
+                    prevSpace = true
+                }
+            } else if v > 0x20 && v <= 0x7D {
+                chars.append(Character(scalar))
+                prevSpace = false
+            }
+        }
+        while chars.last == " " {
+            chars.removeLast()
+        }
+        guard !chars.isEmpty else { return nil }
+        return String(chars)
+    }
+
+    static func cleanVorbisValue(_ raw: String) -> String? {
+        let normalized = raw
+            .replacingOccurrences(of: "\0", with: "")
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.isEmpty ? nil : normalized
+    }
+
+    static func detectImageMime(data: Data, fallback: String?) -> String {
+        if data.count >= 4 {
+            let b0 = data[data.startIndex]
+            let b1 = data[data.startIndex + 1]
+            let b2 = data[data.startIndex + 2]
+            let b3 = data[data.startIndex + 3]
+            if b0 == 0xFF && b1 == 0xD8 && b2 == 0xFF {
+                return "image/jpeg"
+            }
+            if b0 == 0x89 && b1 == 0x50 && b2 == 0x4E && b3 == 0x47 {
+                return "image/png"
+            }
+            if b0 == 0x47 && b1 == 0x49 && b2 == 0x46 && b3 == 0x38 {
+                return "image/gif"
+            }
+            if data.count >= 12,
+               b0 == 0x52 && b1 == 0x49 && b2 == 0x46 && b3 == 0x46,
+               data[data.startIndex + 8] == 0x57,
+               data[data.startIndex + 9] == 0x45,
+               data[data.startIndex + 10] == 0x42,
+               data[data.startIndex + 11] == 0x50 {
+                return "image/webp"
+            }
+        }
+        if let fb = fallback, !fb.isEmpty {
+            return fb
+        }
+        return "image/jpeg"
+    }
+}
+
+enum RichMetadataExtractor {
+    private static let maxMoovSize: UInt64 = 64 * 1024 * 1024
+
+    private static let id3v1Genres: [String] = [
+        "Blues", "Classic Rock", "Country", "Dance", "Disco", "Funk", "Grunge", "Hip-Hop",
+        "Jazz", "Metal", "New Age", "Oldies", "Other", "Pop", "R&B", "Rap", "Reggae", "Rock",
+        "Techno", "Industrial", "Alternative", "Ska", "Death Metal", "Pranks", "Soundtrack",
+        "Euro-Techno", "Ambient", "Trip-Hop", "Vocal", "Jazz+Funk", "Fusion", "Trance",
+        "Classical", "Instrumental", "Acid", "House", "Game", "Sound Clip", "Gospel", "Noise",
+        "AlternRock", "Bass", "Soul", "Punk", "Space", "Meditative", "Instrumental Pop",
+        "Instrumental Rock", "Ethnic", "Gothic", "Darkwave", "Techno-Industrial", "Electronic",
+        "Pop-Folk", "Eurodance", "Dream", "Southern Rock", "Comedy", "Cult", "Gangsta",
+        "Top 40", "Christian Rap", "Pop/Funk", "Jungle", "Native American", "Cabaret",
+        "New Wave", "Psychadelic", "Rave", "Showtunes", "Trailer", "Lo-Fi", "Tribal",
+        "Acid Punk", "Acid Jazz", "Polka", "Retro", "Musical", "Rock & Roll", "Hard Rock",
+        "Folk", "Folk-Rock", "National Folk", "Swing", "Fast Fusion", "Bebop", "Latin",
+        "Revival", "Celtic", "Bluegrass", "Avantgarde", "Gothic Rock", "Progressive Rock",
+        "Psychedelic Rock", "Symphonic Rock", "Slow Rock", "Big Band", "Chorus",
+        "Easy Listening", "Acoustic", "Humour", "Speech", "Chanson", "Opera", "Chamber Music",
+        "Sonata", "Symphony", "Booty Bass", "Primus", "Porn Groove", "Satire", "Slow Jam",
+        "Club", "Tango", "Samba", "Folklore", "Ballad", "Power Ballad", "Rhythmic Soul",
+        "Freestyle", "Duet", "Punk Rock", "Drum Solo", "A capella", "Euro-House", "Dance Hall",
+        "Goa", "Drum & Bass", "Club-House", "Hardcore", "Terror", "Indie", "BritPop",
+        "Negerpunk", "Polsk Punk", "Beat", "Christian Gangsta Rap", "Heavy Metal",
+        "Black Metal", "Crossover", "Contemporary Christian", "Christian Rock", "Merengue",
+        "Salsa", "Thrash Metal", "Anime", "JPop", "Synthpop", "Abstract", "Art Rock",
+        "Baroque", "Bhangra", "Big Beat", "Breakbeat", "Chillout", "Downtempo", "Dub",
+        "EBM", "Eclectic", "Electro", "Electroclash", "Emo", "Experimental", "Garage",
+        "Global", "IDM", "Illbient", "Industro-Goth", "Jam Band", "Krautrock", "Leftfield",
+        "Lounge", "Math Rock", "New Romantic", "Nu-Breakz", "Post-Punk", "Post-Rock",
+        "Psytrance", "Shoegaze", "Space Rock", "Trop Rock", "World Music", "Neoclassical",
+        "Audiobook", "Audio Theatre", "Neue Deutsche Welle", "Podcast", "Indie-Rock",
+        "G-Funk", "Dubstep", "Garage Rock", "Psybient"
+    ]
+
+    static func extract(for track: AudioTrack, decoderStatus: DecoderStatus) -> RichMetadataBundle {
+        var bundle = RichMetadataBundle()
+        let url = track.url.standardizedFileURL
+        let ext = url.pathExtension.lowercased()
+
+        // 1. Direct MP4 / ISOBMFF `ilst` extraction (preserves all standard, binary, multi-value `----` freeform tags & raw `covr`)
+        let parsedMP4 = ["m4a", "mp4", "mov"].contains(ext) && extractMP4Ilst(url: url, into: &bundle)
+
+        // 2. In-process LibreMPEG `AVFormatContext` tags + attached cover pictures (for .mka, .mkv, .ogg, .opus, etc.)
+        if !parsedMP4 || bundle.comments.isEmpty {
+            extractNativeLibreMPEG(url: url, audioStreamIndex: track.audioStreamIndex, into: &bundle)
+        }
+
+        // 3. macOS Core Audio `AudioFile` dictionary + album artwork (for .mp3 ID3v2, .aiff, .wav, .caf)
+        if !parsedMP4 && ext != "ac4" {
+            extractCoreAudioDictionary(url: url, into: &bundle)
+        }
+
+        // 4. External FFmpeg / LibreMPEG CLI stderr tag dump fallback (for --shareable builds on Matroska / Ogg)
+        if bundle.comments.isEmpty, let binPath = decoderStatus.activeBinaryPath {
+            extractExternalFFmpegTags(url: url, binPath: binPath, into: &bundle)
+        }
+
+        // 5. Fill any missing core fields from `AudioTrack` without clobbering richer source values (e.g. full YYYY-MM-DD `DATE`)
+        let baseTitle = url.deletingPathExtension().lastPathComponent
+        if !bundle.hasKey("TITLE"), !track.title.isEmpty, (parsedMP4 || track.title != baseTitle) {
+            bundle.appendTag(key: "TITLE", value: track.title)
+        }
+        if !bundle.hasKey("ARTIST"), !track.artist.isEmpty {
+            bundle.appendTag(key: "ARTIST", value: track.artist)
+        }
+        if !bundle.hasKey("ALBUMARTIST"), !track.albumArtist.isEmpty {
+            bundle.appendTag(key: "ALBUMARTIST", value: track.albumArtist)
+        }
+        let parentFolder = url.deletingLastPathComponent().lastPathComponent
+        if !bundle.hasKey("ALBUM"), !track.album.isEmpty, (parsedMP4 || track.album != parentFolder) {
+            bundle.appendTag(key: "ALBUM", value: track.album)
+        }
+        if !bundle.hasKey("DATE"), !track.year.isEmpty {
+            bundle.appendTag(key: "DATE", value: track.year)
+        }
+        if !bundle.hasKey("TRACKNUMBER"), let tn = track.trackNumber, tn > 0 {
+            bundle.appendTag(key: "TRACKNUMBER", value: "\(tn)")
+        }
+        if !bundle.hasKey("TRACKTOTAL"), let tt = track.trackTotal, tt > 0 {
+            bundle.appendTag(key: "TRACKTOTAL", value: "\(tt)")
+        }
+        if !bundle.hasKey("DISCNUMBER"), let dn = track.discNumber, dn > 0 {
+            bundle.appendTag(key: "DISCNUMBER", value: "\(dn)")
+        }
+        if !bundle.hasKey("DISCTOTAL"), let dt = track.discTotal, dt > 0 {
+            bundle.appendTag(key: "DISCTOTAL", value: "\(dt)")
+        }
+
+        return bundle
+    }
+
+    // MARK: MP4 `ilst` Full Parser
+
+    private static func extractMP4Ilst(url: URL, into bundle: inout RichMetadataBundle) -> Bool {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+
+        let fileSize: UInt64
+        do {
+            fileSize = try handle.seekToEnd()
+            try handle.seek(toOffset: 0)
+        } catch {
+            return false
+        }
+        guard fileSize >= 16 else { return false }
+
+        var offset: UInt64 = 0
+        var foundMP4 = false
+
+        while offset + 8 <= fileSize {
+            do {
+                try handle.seek(toOffset: offset)
+                guard let header = try handle.read(upToCount: 16), header.count >= 8 else { break }
+                let size32 = readUInt32BE(header, at: 0)
+                let fourCC = readFourCC(header, at: 4)
+
+                var boxSize = UInt64(size32)
+                var headerLen: UInt64 = 8
+                if size32 == 1 {
+                    guard header.count >= 16 else { break }
+                    boxSize = readUInt64BE(header, at: 8)
+                    headerLen = 16
+                } else if size32 == 0 {
+                    boxSize = fileSize - offset
+                }
+                guard boxSize >= headerLen, offset <= fileSize - boxSize else { break }
+
+                if fourCC == "ftyp" {
+                    foundMP4 = true
+                } else if fourCC == "moov" {
+                    foundMP4 = true
+                    let payloadLen = boxSize - headerLen
+                    if payloadLen > 0 && payloadLen <= maxMoovSize {
+                        try handle.seek(toOffset: offset + headerLen)
+                        if let moovData = try handle.read(upToCount: Int(payloadLen)),
+                           moovData.count == Int(payloadLen) {
+                            parseMoovForExport(moovData, into: &bundle)
+                        }
+                    }
+                }
+                offset += boxSize
+            } catch {
+                break
+            }
+        }
+        return foundMP4
+    }
+
+    private static func parseMoovForExport(_ data: Data, into bundle: inout RichMetadataBundle) {
+        iterateBoxes(in: data, range: 0..<data.count) { fourCC, payloadRange in
+            if fourCC == "udta" {
+                parseUdtaForExport(data, range: payloadRange, into: &bundle)
+            } else if fourCC == "meta" {
+                parseMetaBoxForExport(data, range: payloadRange, into: &bundle)
+            }
+        }
+    }
+
+    private static func parseUdtaForExport(_ data: Data, range: Range<Int>, into bundle: inout RichMetadataBundle) {
+        iterateBoxes(in: data, range: range) { fourCC, metaRange in
+            if fourCC == "meta" {
+                parseMetaBoxForExport(data, range: metaRange, into: &bundle)
+            }
+        }
+    }
+
+    private static func parseMetaBoxForExport(_ data: Data, range: Range<Int>, into bundle: inout RichMetadataBundle) {
+        guard range.count > 8 else { return }
+        // Standard ISOBMFF `meta` is a FullBox with 4-byte version/flags; fallback to 0-offset if omitted
+        var foundIlst = false
+        let fullBoxStart = range.lowerBound + 4
+        iterateBoxes(in: data, range: fullBoxStart..<range.upperBound) { childFCC, childRange in
+            if childFCC == "ilst" {
+                foundIlst = true
+                parseIlstForExport(data, range: childRange, into: &bundle)
+            }
+        }
+        if !foundIlst {
+            iterateBoxes(in: data, range: range) { childFCC, childRange in
+                if childFCC == "ilst" {
+                    parseIlstForExport(data, range: childRange, into: &bundle)
+                }
+            }
+        }
+    }
+
+    private static func parseIlstForExport(_ data: Data, range: Range<Int>, into bundle: inout RichMetadataBundle) {
+        var deferredID3GenreIndex: Int?
+
+        iterateBoxes(in: data, range: range) { atomFCC, itemRange in
+            if atomFCC == "----" {
+                parseFreeformAtomForExport(data, range: itemRange, into: &bundle)
+                return
+            }
+
+            iterateBoxes(in: data, range: itemRange) { subFCC, dataRange in
+                guard subFCC == "data", dataRange.count >= 8 else { return }
+                let dataType = readUInt32BE(data, at: dataRange.lowerBound)
+                let valStart = dataRange.lowerBound + 8
+                guard valStart <= dataRange.upperBound else { return }
+                let payload = data[valStart..<dataRange.upperBound]
+
+                switch atomFCC {
+                case "\u{00A9}nam":
+                    if let s = decodeAtomText(payload, dataType: dataType) { bundle.appendTag(key: "TITLE", value: s) }
+                case "\u{00A9}ART":
+                    if let s = decodeAtomText(payload, dataType: dataType) { bundle.appendTag(key: "ARTIST", value: s) }
+                case "aART":
+                    if let s = decodeAtomText(payload, dataType: dataType) { bundle.appendTag(key: "ALBUMARTIST", value: s) }
+                case "\u{00A9}alb":
+                    if let s = decodeAtomText(payload, dataType: dataType) { bundle.appendTag(key: "ALBUM", value: s) }
+                case "\u{00A9}day":
+                    if let s = decodeAtomText(payload, dataType: dataType) { bundle.appendTag(key: "DATE", value: s) }
+                case "\u{00A9}gen":
+                    if let s = decodeAtomText(payload, dataType: dataType) { bundle.appendTag(key: "GENRE", value: s) }
+                case "\u{00A9}wrt":
+                    if let s = decodeAtomText(payload, dataType: dataType) { bundle.appendTag(key: "COMPOSER", value: s) }
+                case "\u{00A9}cmt":
+                    if let s = decodeAtomText(payload, dataType: dataType) { bundle.appendTag(key: "COMMENT", value: s) }
+                case "\u{00A9}lyr":
+                    if let s = decodeAtomText(payload, dataType: dataType) { bundle.appendTag(key: "LYRICS", value: s) }
+                case "cprt":
+                    if let s = decodeAtomText(payload, dataType: dataType) { bundle.appendTag(key: "COPYRIGHT", value: s) }
+                case "\u{00A9}grp":
+                    if let s = decodeAtomText(payload, dataType: dataType) { bundle.appendTag(key: "GROUPING", value: s) }
+                case "\u{00A9}too":
+                    if let s = decodeAtomText(payload, dataType: dataType) { bundle.appendTag(key: "ENCODEDBY", value: s) }
+                case "desc":
+                    if let s = decodeAtomText(payload, dataType: dataType) { bundle.appendTag(key: "DESCRIPTION", value: s) }
+                case "ldes":
+                    if let s = decodeAtomText(payload, dataType: dataType) { bundle.appendTag(key: "SYNOPSIS", value: s) }
+                case "\u{00A9}wrk":
+                    if let s = decodeAtomText(payload, dataType: dataType) { bundle.appendTag(key: "WORK", value: s) }
+                case "\u{00A9}mvn":
+                    if let s = decodeAtomText(payload, dataType: dataType) { bundle.appendTag(key: "MOVEMENTNAME", value: s) }
+                case "\u{00A9}mvi":
+                    if let n = decodeAtomInt(payload, signed: false), n > 0 { bundle.appendTag(key: "MOVEMENT", value: "\(n)") }
+                case "\u{00A9}mvc":
+                    if let n = decodeAtomInt(payload, signed: false), n > 0 { bundle.appendTag(key: "MOVEMENTTOTAL", value: "\(n)") }
+                case "sonm":
+                    if let s = decodeAtomText(payload, dataType: dataType) { bundle.appendTag(key: "TITLESORT", value: s) }
+                case "soar":
+                    if let s = decodeAtomText(payload, dataType: dataType) { bundle.appendTag(key: "ARTISTSORT", value: s) }
+                case "soaa":
+                    if let s = decodeAtomText(payload, dataType: dataType) { bundle.appendTag(key: "ALBUMARTISTSORT", value: s) }
+                case "soal":
+                    if let s = decodeAtomText(payload, dataType: dataType) { bundle.appendTag(key: "ALBUMSORT", value: s) }
+                case "soco":
+                    if let s = decodeAtomText(payload, dataType: dataType) { bundle.appendTag(key: "COMPOSERSORT", value: s) }
+                case "trkn":
+                    if payload.count >= 4 {
+                        let trk = Int(readUInt16BE(data, at: valStart + 2))
+                        if trk > 0 { bundle.appendTag(key: "TRACKNUMBER", value: "\(trk)") }
+                        if payload.count >= 6 {
+                            let tot = Int(readUInt16BE(data, at: valStart + 4))
+                            if tot > 0 { bundle.appendTag(key: "TRACKTOTAL", value: "\(tot)") }
+                        }
+                    }
+                case "disk":
+                    if payload.count >= 4 {
+                        let dsc = Int(readUInt16BE(data, at: valStart + 2))
+                        if dsc > 0 { bundle.appendTag(key: "DISCNUMBER", value: "\(dsc)") }
+                        if payload.count >= 6 {
+                            let dtot = Int(readUInt16BE(data, at: valStart + 4))
+                            if dtot > 0 { bundle.appendTag(key: "DISCTOTAL", value: "\(dtot)") }
+                        }
+                    }
+                case "gnre":
+                    if payload.count >= 2 {
+                        let code = Int(readUInt16BE(data, at: valStart))
+                        if code >= 1 && code <= id3v1Genres.count {
+                            deferredID3GenreIndex = code - 1
+                        }
+                    }
+                case "tmpo":
+                    if let bpm = decodeAtomInt(payload, signed: false), bpm > 0 {
+                        bundle.appendTag(key: "BPM", value: "\(bpm)")
+                    }
+                case "cpil":
+                    if let v = decodeAtomInt(payload, signed: false), v != 0 {
+                        bundle.appendTag(key: "COMPILATION", value: "1")
+                    }
+                case "pgap":
+                    if let v = decodeAtomInt(payload, signed: false), v != 0 {
+                        bundle.appendTag(key: "GAPLESS", value: "1")
+                    }
+                case "rtng":
+                    if let v = decodeAtomInt(payload, signed: false), v > 0 {
+                        bundle.appendTag(key: "ITUNESADVISORY", value: "\(v)")
+                    }
+                case "covr":
+                    if (dataType == 13 || dataType == 14 || dataType == 0 || dataType == 27), !payload.isEmpty {
+                        let hint: String? = (dataType == 14) ? "image/png" : ((dataType == 13) ? "image/jpeg" : nil)
+                        bundle.appendPicture(data: Data(payload), fallbackMime: hint)
+                    }
+                default:
+                    break
+                }
+            }
+        }
+
+        if !bundle.hasKey("GENRE"), let idx = deferredID3GenreIndex {
+            bundle.appendTag(key: "GENRE", value: id3v1Genres[idx])
+        }
+    }
+
+    private static func parseFreeformAtomForExport(_ data: Data, range: Range<Int>, into bundle: inout RichMetadataBundle) {
+        var rawName = ""
+        var values: [String] = []
+
+        iterateBoxes(in: data, range: range) { subFCC, subRange in
+            if subFCC == "name", subRange.count > 4 {
+                let slice = data[(subRange.lowerBound + 4)..<subRange.upperBound]
+                rawName = String(data: Data(slice), encoding: .utf8) ?? ""
+            } else if subFCC == "data", subRange.count >= 8 {
+                let dtype = readUInt32BE(data, at: subRange.lowerBound)
+                let slice = data[(subRange.lowerBound + 8)..<subRange.upperBound]
+                if dtype == 1 || dtype == 2 {
+                    if let s = decodeAtomText(slice, dataType: dtype) {
+                        values.append(s)
+                    }
+                } else if dtype == 21 {
+                    if let n = decodeAtomInt(slice, signed: true) {
+                        values.append("\(n)")
+                    }
+                } else if dtype == 22 {
+                    if let n = decodeAtomInt(slice, signed: false) {
+                        values.append("\(n)")
+                    }
+                } else if dtype == 0, slice.count <= 4096, let s = String(data: Data(slice), encoding: .utf8) {
+                    values.append(s)
+                }
+            }
+        }
+
+        let trimmedName = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowerName = trimmedName.lowercased()
+        // Skip AAC/QuickTime encoder priming/internal binary atoms that do not apply to decoded lossless FLAC
+        let ignoredFreeform: Set<String> = ["itunsmpb", "itunmovi", "itunnorm", "encoding params"]
+        guard !trimmedName.isEmpty, !ignoredFreeform.contains(lowerName) else { return }
+
+        for val in values {
+            bundle.appendTag(key: trimmedName, value: val)
+        }
+    }
+
+    private static func decodeAtomText(_ slice: Data.SubSequence, dataType: UInt32) -> String? {
+        guard !slice.isEmpty else { return nil }
+        let rawData = Data(slice)
+        if dataType == 2 {
+            return String(data: rawData, encoding: .utf16BigEndian)
+        }
+        return String(data: rawData, encoding: .utf8)
+    }
+
+    private static func decodeAtomInt(_ slice: Data.SubSequence, signed: Bool) -> Int64? {
+        let count = slice.count
+        guard count >= 1 && count <= 8 else { return nil }
+        var u: UInt64 = 0
+        for b in slice {
+            u = (u << 8) | UInt64(b)
+        }
+        if signed {
+            let shift = (8 - count) * 8
+            return (Int64(bitPattern: u << shift)) >> shift
+        }
+        return Int64(bitPattern: u)
+    }
+
+    // MARK: Native LibreMPEG, Core Audio & External FFmpeg Tag Fallbacks
+
+    private final class NativeTagCollector {
+        var rawTags: [(String, String)] = []
+        var rawPics: [(Data, String)] = []
+    }
+
+    private static func extractNativeLibreMPEG(url: URL, audioStreamIndex: Int, into bundle: inout RichMetadataBundle) {
+        guard ac4_native_is_available() != 0 else { return }
+        let path = url.path
+        guard path.hasPrefix("/") else { return }
+
+        let collector = NativeTagCollector()
+        let ok: Int32 = withExtendedLifetime(collector) {
+            let opaque = Unmanaged.passUnretained(collector).toOpaque()
+            return ac4_native_extract_metadata(
+                path,
+                Int32(max(0, audioStreamIndex)),
+                { keyPtr, valPtr, userdata in
+                    guard let keyPtr, let valPtr, let userdata else { return }
+                    let box = Unmanaged<NativeTagCollector>.fromOpaque(userdata).takeUnretainedValue()
+                    box.rawTags.append((String(cString: keyPtr), String(cString: valPtr)))
+                },
+                { dataPtr, dataLen, mimePtr, userdata in
+                    guard let dataPtr, dataLen > 0, dataLen <= 16_777_000, let userdata else { return }
+                    let box = Unmanaged<NativeTagCollector>.fromOpaque(userdata).takeUnretainedValue()
+                    let mime = mimePtr.map { String(cString: $0) } ?? "image/jpeg"
+                    box.rawPics.append((Data(bytes: dataPtr, count: dataLen), mime))
+                },
+                opaque
+            )
+        }
+        guard ok != 0 else { return }
+
+        for (rawKey, rawVal) in collector.rawTags {
+            appendNormalizedGenericTag(rawKey: rawKey, rawValue: rawVal, into: &bundle)
+        }
+        if bundle.pictures.isEmpty {
+            for (picData, mime) in collector.rawPics {
+                bundle.appendPicture(data: picData, fallbackMime: mime)
+            }
+        }
+    }
+
+    private static func extractCoreAudioDictionary(url: URL, into bundle: inout RichMetadataBundle) {
+        var audioFile: AudioFileID?
+        let openStatus = AudioFileOpenURL(url as CFURL, .readPermission, 0, &audioFile)
+        guard openStatus == noErr, let fileID = audioFile else { return }
+        defer { AudioFileClose(fileID) }
+
+        var dictSize: UInt32 = 0
+        if AudioFileGetPropertyInfo(fileID, kAudioFilePropertyInfoDictionary, &dictSize, nil) == noErr,
+           dictSize > 0 {
+            var unmanagedDict: Unmanaged<CFDictionary>?
+            var propSize = UInt32(MemoryLayout<Unmanaged<CFDictionary>?>.size)
+            if AudioFileGetProperty(fileID, kAudioFilePropertyInfoDictionary, &propSize, &unmanagedDict) == noErr,
+               let cfDict = unmanagedDict?.takeRetainedValue() as? [String: Any] {
+                for (k, v) in cfDict {
+                    let lk = k.lowercased()
+                    if lk == "approximate duration in seconds" || lk == "source bit depth" || lk == "channel layout" {
+                        continue
+                    }
+                    let valStr: String
+                    if let s = v as? String {
+                        valStr = s
+                    } else if let n = v as? NSNumber {
+                        valStr = n.stringValue
+                    } else {
+                        continue
+                    }
+                    switch lk {
+                    case "title": bundle.appendTag(key: "TITLE", value: valStr)
+                    case "artist": bundle.appendTag(key: "ARTIST", value: valStr)
+                    case "album": bundle.appendTag(key: "ALBUM", value: valStr)
+                    case "album artist": bundle.appendTag(key: "ALBUMARTIST", value: valStr)
+                    case "year", "recorded date": bundle.appendTag(key: "DATE", value: valStr)
+                    case "genre": bundle.appendTag(key: "GENRE", value: valStr)
+                    case "composer": bundle.appendTag(key: "COMPOSER", value: valStr)
+                    case "comments": bundle.appendTag(key: "COMMENT", value: valStr)
+                    case "copyright": bundle.appendTag(key: "COPYRIGHT", value: valStr)
+                    case "lyrics": bundle.appendTag(key: "LYRICS", value: valStr)
+                    case "tempo": bundle.appendTag(key: "BPM", value: valStr)
+                    case "track number":
+                        appendSlashPair(valStr, numKey: "TRACKNUMBER", totalKey: "TRACKTOTAL", into: &bundle)
+                    case "disc number":
+                        appendSlashPair(valStr, numKey: "DISCNUMBER", totalKey: "DISCTOTAL", into: &bundle)
+                    default:
+                        bundle.appendTag(key: k, value: valStr)
+                    }
+                }
+            }
+        }
+
+        if bundle.pictures.isEmpty {
+            var unmanagedArt: Unmanaged<CFData>?
+            var artPropSize = UInt32(MemoryLayout<Unmanaged<CFData>?>.size)
+            if AudioFileGetProperty(fileID, kAudioFilePropertyAlbumArtwork, &artPropSize, &unmanagedArt) == noErr,
+               let cfData = unmanagedArt?.takeRetainedValue() {
+                bundle.appendPicture(data: cfData as Data)
+            }
+        }
+    }
+
+    private static func extractExternalFFmpegTags(url: URL, binPath: String, into bundle: inout RichMetadataBundle) {
+        let mediaPath = url.path
+        guard mediaPath.hasPrefix("/"), binPath.hasPrefix("/"),
+              FileManager.default.isExecutableFile(atPath: binPath) else {
+            return
+        }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: binPath)
+        proc.arguments = ["-nostdin", "-hide_banner", "-i", mediaPath]
+        let errPipe = Pipe()
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = errPipe
+        do {
+            try proc.run()
+        } catch {
+            return
+        }
+        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        guard let output = String(data: errData, encoding: .utf8) else { return }
+
+        var inMetadataBlock = false
+        for rawLine in output.components(separatedBy: .newlines) {
+            let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
+            if trimmed == "Metadata:" {
+                inMetadataBlock = true
+                continue
+            }
+            if trimmed.hasPrefix("Duration:") || trimmed.hasPrefix("Stream #") || trimmed.hasPrefix("At least one output") {
+                inMetadataBlock = false
+                continue
+            }
+            guard inMetadataBlock, let colon = trimmed.firstIndex(of: ":") else { continue }
+            let k = String(trimmed[..<colon]).trimmingCharacters(in: .whitespaces)
+            let v = String(trimmed[trimmed.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
+            appendNormalizedGenericTag(rawKey: k, rawValue: v, into: &bundle)
+        }
+    }
+
+    private static func appendNormalizedGenericTag(rawKey: String, rawValue: String, into bundle: inout RichMetadataBundle) {
+        let lower = rawKey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let ignored: Set<String> = [
+            "major_brand", "minor_version", "compatible_brands",
+            "handler_name", "vendor_id", "creation_time", "itunsmpb"
+        ]
+        guard !lower.isEmpty, !ignored.contains(lower) else { return }
+        if lower == "encoder" && rawValue.lowercased().hasPrefix("lavf") { return }
+
+        switch lower {
+        case "album_artist", "albumartist":
+            bundle.appendTag(key: "ALBUMARTIST", value: rawValue)
+        case "track", "tracknumber":
+            appendSlashPair(rawValue, numKey: "TRACKNUMBER", totalKey: "TRACKTOTAL", into: &bundle)
+        case "disc", "discnumber":
+            appendSlashPair(rawValue, numKey: "DISCNUMBER", totalKey: "DISCTOTAL", into: &bundle)
+        case "year", "date":
+            bundle.appendTag(key: "DATE", value: rawValue)
+        default:
+            bundle.appendTag(key: rawKey, value: rawValue)
+        }
+    }
+
+    private static func appendSlashPair(_ raw: String, numKey: String, totalKey: String, into bundle: inout RichMetadataBundle) {
+        let parts = raw.split(separator: "/")
+        if let first = parts.first?.trimmingCharacters(in: .whitespaces), let n = Int(first), n > 0 {
+            bundle.appendTag(key: numKey, value: "\(n)")
+        } else {
+            bundle.appendTag(key: numKey, value: raw)
+        }
+        if parts.count > 1 {
+            let second = parts[1].trimmingCharacters(in: .whitespaces)
+            if let tot = Int(second), tot > 0 {
+                bundle.appendTag(key: totalKey, value: "\(tot)")
+            }
+        }
+    }
+
+    // MARK: Binary Box Helpers
+
+    private static func readFourCC(_ data: Data, at offset: Int) -> String {
+        String(data: Data(data[offset..<(offset + 4)]), encoding: .isoLatin1) ?? "    "
+    }
+
+    private static func iterateBoxes(
+        in data: Data,
+        range: Range<Int>,
+        visitor: (String, Range<Int>) -> Void
+    ) {
+        var pos = range.lowerBound
+        let end = range.upperBound
+        while pos >= 0 && pos + 8 <= end {
+            let size32 = Int(readUInt32BE(data, at: pos))
+            let fourCC = readFourCC(data, at: pos + 4)
+            var boxLen = size32
+            var hdrLen = 8
+            if size32 == 1 {
+                guard pos + 16 <= end else { break }
+                let size64 = readUInt64BE(data, at: pos + 8)
+                guard size64 <= UInt64(Int.max) else { break }
+                boxLen = Int(size64)
+                hdrLen = 16
+            } else if size32 == 0 {
+                boxLen = end - pos
+            }
+            guard boxLen >= hdrLen, pos <= end - boxLen else { break }
+            visitor(fourCC, (pos + hdrLen)..<(pos + boxLen))
+            pos += boxLen
+        }
+    }
+
+    private static func readUInt16BE(_ data: Data, at offset: Int) -> UInt16 {
+        (UInt16(data[offset]) << 8) | UInt16(data[offset + 1])
+    }
+
+    private static func readUInt32BE(_ data: Data, at offset: Int) -> UInt32 {
+        (UInt32(data[offset]) << 24)
+            | (UInt32(data[offset + 1]) << 16)
+            | (UInt32(data[offset + 2]) << 8)
+            | UInt32(data[offset + 3])
+    }
+
+    private static func readUInt64BE(_ data: Data, at offset: Int) -> UInt64 {
+        let hi = UInt64(readUInt32BE(data, at: offset))
+        let lo = UInt64(readUInt32BE(data, at: offset + 4))
+        return (hi << 32) | lo
+    }
+}
+
+final class ExportCancellationToken: @unchecked Sendable {
+    private let lock: UnsafeMutablePointer<os_unfair_lock>
+    private var cancelledFlag: Bool = false
+
+    init() {
+        self.lock = .allocate(capacity: 1)
+        self.lock.initialize(to: os_unfair_lock())
+    }
+
+    deinit {
+        lock.deallocate()
+    }
+
+    var isCancelled: Bool {
+        os_unfair_lock_lock(lock)
+        let v = cancelledFlag
+        os_unfair_lock_unlock(lock)
+        return v
+    }
+
+    func cancel() {
+        os_unfair_lock_lock(lock)
+        cancelledFlag = true
+        os_unfair_lock_unlock(lock)
+    }
+}
+
+enum FLACExporter {
+    enum ExportError: LocalizedError {
+        case alreadyFLAC(String)
+        case unreadableSource(String)
+        case missingAC4Decoder
+        case encoderInitFailed(OSStatus)
+        case encoderWriteFailed(OSStatus)
+        case decodeFailed(String)
+        case invalidFLACOutput
+        case cancelled
+
+        var errorDescription: String? {
+            switch self {
+            case .alreadyFLAC(let name):
+                return "'\(name)' is already a FLAC file."
+            case .unreadableSource(let name):
+                return "Source file '\(name)' could not be read."
+            case .missingAC4Decoder:
+                return "No AC-4 decoder available. Build with ./librempeg or locate your LibreMPEG binary first."
+            case .encoderInitFailed(let st):
+                return "Core Audio FLAC encoder failed to initialize (OSStatus \(st))."
+            case .encoderWriteFailed(let st):
+                return "Core Audio FLAC encoder write failed (OSStatus \(st))."
+            case .decodeFailed(let reason):
+                return reason
+            case .invalidFLACOutput:
+                return "Encoded FLAC stream was empty or malformed."
+            case .cancelled:
+                return "Export cancelled."
+            }
+        }
+    }
+
+    static func destinationURL(for sourceURL: URL) -> URL {
+        let std = sourceURL.standardizedFileURL
+        let dir = std.deletingLastPathComponent()
+        let stem = std.deletingPathExtension().lastPathComponent
+        return dir.appendingPathComponent(stem).appendingPathExtension("flac")
+    }
+
+    static func exportInPlace(
+        track: AudioTrack,
+        decoderStatus: DecoderStatus,
+        token: ExportCancellationToken,
+        onProgress: @escaping @Sendable (Double) -> Void
+    ) throws -> URL {
+        let srcURL = track.url.standardizedFileURL
+        let destURL = destinationURL(for: srcURL)
+        guard srcURL.path.lowercased() != destURL.path.lowercased() else {
+            throw ExportError.alreadyFLAC(srcURL.lastPathComponent)
+        }
+        guard srcURL.path.hasPrefix("/"), FileManager.default.isReadableFile(atPath: srcURL.path) else {
+            throw ExportError.unreadableSource(srcURL.lastPathComponent)
+        }
+        if token.isCancelled {
+            throw ExportError.cancelled
+        }
+
+        let fm = FileManager.default
+        let rawTempURL = fm.temporaryDirectory
+            .appendingPathComponent("ac4_export_raw_\(UUID().uuidString).flac")
+        let parentDir = destURL.deletingLastPathComponent()
+        let stagingName = ".\(destURL.deletingPathExtension().lastPathComponent).\(UUID().uuidString).flac.tmp"
+        let stagingURL = parentDir.appendingPathComponent(stagingName)
+
+        defer {
+            try? fm.removeItem(at: rawTempURL)
+            try? fm.removeItem(at: stagingURL)
+        }
+
+        let preferredRate = chooseFLACSampleRate(for: track)
+        let (extFile, actualSampleRate) = try openCoreAudioFLACWriter(at: rawTempURL, preferredSampleRate: preferredRate)
+        var writerOpen = true
+        defer {
+            if writerOpen {
+                ExtAudioFileDispose(extFile)
+            }
+        }
+
+        let expectedFrames: Int64 = {
+            if let dur = track.durationSeconds, dur > 0.1 {
+                return max(1, Int64((dur * Double(actualSampleRate)).rounded()))
+            }
+            return 0
+        }()
+
+        let writerBox = FLACFrameSink(
+            extFile: extFile,
+            expectedFrames: expectedFrames,
+            token: token,
+            onProgress: onProgress
+        )
+
+        try decodeTrackIntoFLAC(
+            track: track,
+            srcURL: srcURL,
+            sampleRate: actualSampleRate,
+            decoderStatus: decoderStatus,
+            sink: writerBox
+        )
+
+        if token.isCancelled {
+            throw ExportError.cancelled
+        }
+        if let writeErr = writerBox.writeErrorStatus {
+            throw ExportError.encoderWriteFailed(writeErr)
+        }
+        guard writerBox.framesWritten > 0 else {
+            throw ExportError.invalidFLACOutput
+        }
+
+        // Core Audio's FLAC encoder uses 4608-frame packets; pad micro-clips (<96 ms) so packet #1 always flushes
+        if writerBox.framesWritten < 4608 {
+            let padFrames = Int(4608 - writerBox.framesWritten)
+            let zeros = [Float](repeating: 0, count: padFrames * 2)
+            _ = zeros.withUnsafeBufferPointer { ptr in
+                writerBox.writeInterleaved(ptr.baseAddress!, frameCount: padFrames)
+            }
+        }
+
+        // Synchronously finalize STREAMINFO (exact sample count + 128-bit audio MD5) and close rawTempURL
+        writerOpen = false
+        let disposeStatus = ExtAudioFileDispose(extFile)
+        guard disposeStatus == noErr else {
+            throw ExportError.encoderWriteFailed(disposeStatus)
+        }
+
+        if token.isCancelled {
+            throw ExportError.cancelled
+        }
+
+        // Extract complete source metadata & embedded cover artwork
+        let metadata = RichMetadataExtractor.extract(for: track, decoderStatus: decoderStatus)
+
+        // Splice RFC 9639 VORBIS_COMMENT + PICTURE + PADDING blocks before FLAC audio frames
+        try writeTaggedFLAC(rawFLACURL: rawTempURL, stagingURL: stagingURL, metadata: metadata, token: token)
+
+        if token.isCancelled {
+            throw ExportError.cancelled
+        }
+
+        // Atomically commit into `<original_basename>.flac` alongside the source file
+        if fm.fileExists(atPath: destURL.path) {
+            _ = try fm.replaceItemAt(destURL, withItemAt: stagingURL)
+        } else {
+            try fm.moveItem(at: stagingURL, to: destURL)
+        }
+
+        onProgress(1.0)
+        return destURL
+    }
+
+    // MARK: Core Audio 24-Bit Lossless FLAC Writer
+
+    private static func chooseFLACSampleRate(for track: AudioTrack) -> Int {
+        if track.isAC4 { return 48_000 }
+        guard let sr = track.sampleRateHz, sr >= 8_000 && sr <= 192_000 else {
+            return 48_000
+        }
+        return sr
+    }
+
+    private static func openCoreAudioFLACWriter(at url: URL, preferredSampleRate: Int) throws -> (ExtAudioFileRef, Int) {
+        let ratesToTry = preferredSampleRate == 48_000 ? [48_000] : [preferredSampleRate, 48_000]
+        var lastStatus: OSStatus = -1
+
+        for rate in ratesToTry {
+            for flags in [AudioFormatFlags(kAppleLosslessFormatFlag_24BitSourceData), AudioFormatFlags(0)] {
+                var dstASBD = AudioStreamBasicDescription(
+                    mSampleRate: Float64(rate),
+                    mFormatID: kAudioFormatFLAC,
+                    mFormatFlags: flags,
+                    mBytesPerPacket: 0,
+                    mFramesPerPacket: 0,
+                    mBytesPerFrame: 0,
+                    mChannelsPerFrame: 2,
+                    mBitsPerChannel: 0,
+                    mReserved: 0
+                )
+                var extRef: ExtAudioFileRef?
+                let st = ExtAudioFileCreateWithURL(
+                    url as CFURL,
+                    kAudioFileFLACType,
+                    &dstASBD,
+                    nil,
+                    AudioFileFlags.eraseFile.rawValue,
+                    &extRef
+                )
+                lastStatus = st
+                guard st == noErr, let fileRef = extRef else { continue }
+
+                var clientASBD = AudioStreamBasicDescription(
+                    mSampleRate: Float64(rate),
+                    mFormatID: kAudioFormatLinearPCM,
+                    mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+                    mBytesPerPacket: 8,
+                    mFramesPerPacket: 1,
+                    mBytesPerFrame: 8,
+                    mChannelsPerFrame: 2,
+                    mBitsPerChannel: 32,
+                    mReserved: 0
+                )
+                let propSt = ExtAudioFileSetProperty(
+                    fileRef,
+                    kExtAudioFileProperty_ClientDataFormat,
+                    UInt32(MemoryLayout<AudioStreamBasicDescription>.size),
+                    &clientASBD
+                )
+                if propSt == noErr {
+                    return (fileRef, rate)
+                }
+                ExtAudioFileDispose(fileRef)
+                lastStatus = propSt
+            }
+        }
+        throw ExportError.encoderInitFailed(lastStatus)
+    }
+
+    private final class FLACFrameSink {
+        let extFile: ExtAudioFileRef
+        let expectedFrames: Int64
+        let token: ExportCancellationToken
+        let onProgress: @Sendable (Double) -> Void
+
+        private(set) var framesWritten: Int64 = 0
+        private(set) var writeErrorStatus: OSStatus?
+        private var lastProgressFrames: Int64 = 0
+
+        init(
+            extFile: ExtAudioFileRef,
+            expectedFrames: Int64,
+            token: ExportCancellationToken,
+            onProgress: @escaping @Sendable (Double) -> Void
+        ) {
+            self.extFile = extFile
+            self.expectedFrames = expectedFrames
+            self.token = token
+            self.onProgress = onProgress
+        }
+
+        func writeInterleaved(_ samplesPtr: UnsafePointer<Float>, frameCount: Int) -> Bool {
+            if token.isCancelled { return false }
+            guard frameCount > 0 else { return true }
+
+            let byteSize = UInt32(frameCount * 2 * MemoryLayout<Float>.size)
+            var abl = AudioBufferList(
+                mNumberBuffers: 1,
+                mBuffers: AudioBuffer(
+                    mNumberChannels: 2,
+                    mDataByteSize: byteSize,
+                    mData: UnsafeMutableRawPointer(mutating: samplesPtr)
+                )
+            )
+            let st = ExtAudioFileWrite(extFile, UInt32(frameCount), &abl)
+            if st != noErr {
+                writeErrorStatus = st
+                return false
+            }
+
+            framesWritten &+= Int64(frameCount)
+            if expectedFrames > 0, (framesWritten - lastProgressFrames) >= 24_000 {
+                lastProgressFrames = framesWritten
+                let frac = min(0.96, max(0.0, Double(framesWritten) / Double(expectedFrames)))
+                onProgress(frac)
+            }
+            return !token.isCancelled
+        }
+    }
+
+    // MARK: 3-Tier Lossless Source Decode (Unity Gain, Independent of Live Playback)
+
+    private static func decodeTrackIntoFLAC(
+        track: AudioTrack,
+        srcURL: URL,
+        sampleRate: Int,
+        decoderStatus: DecoderStatus,
+        sink: FLACFrameSink
+    ) throws {
+        let mediaPath = srcURL.path
+        let caps = decoderStatus.capabilities
+        let streamIdx = max(0, track.audioStreamIndex)
+
+        // Tier 1: Built-in statically linked LibreMPEG (native 32-bit float AC-4 IMS)
+        if caps.isBuiltInNative && ac4_native_is_available() != 0 {
+            if track.isAC4 || ac4_native_can_decode_file(mediaPath, Int32(streamIdx)) != 0 {
+                var errBuf = [CChar](repeating: 0, count: 512)
+                let rc: Int32 = withExtendedLifetime(sink) {
+                    let opaque = Unmanaged.passUnretained(sink).toOpaque()
+                    return ac4_native_stream_file(
+                        mediaPath,
+                        Int32(streamIdx),
+                        0.0,
+                        Int32(sampleRate),
+                        { samplesPtr, frameCount, userdata in
+                            guard let samplesPtr, let userdata, frameCount > 0 else { return 1 }
+                            let box = Unmanaged<FLACFrameSink>.fromOpaque(userdata).takeUnretainedValue()
+                            return box.writeInterleaved(samplesPtr, frameCount: Int(frameCount)) ? 1 : 0
+                        },
+                        opaque,
+                        &errBuf,
+                        errBuf.count
+                    )
+                }
+                if sink.token.isCancelled {
+                    throw ExportError.cancelled
+                }
+                if rc < 0 {
+                    let msg = String(cString: errBuf).trimmingCharacters(in: .whitespacesAndNewlines)
+                    throw ExportError.decodeFailed(msg.isEmpty ? "Built-in LibreMPEG decode failed." : msg)
+                }
+                return
+            }
+        }
+
+        // Tier 2: macOS Core Audio for standard formats (.wav, .aiff, ALAC/AAC .m4a, .mp3)
+        if !track.isAC4, let audioFile = try? AVAudioFile(forReading: srcURL), audioFile.length > 0 {
+            try decodeViaCoreAudio(audioFile: audioFile, targetSampleRate: sampleRate, sink: sink)
+            return
+        }
+
+        // Tier 3: External LibreMPEG / FFmpeg CLI (for --shareable builds)
+        guard let binPath = decoderStatus.activeBinaryPath,
+              binPath.hasPrefix("/"),
+              FileManager.default.isExecutableFile(atPath: binPath) else {
+            throw track.isAC4
+                ? ExportError.missingAC4Decoder
+                : ExportError.decodeFailed("Audio format is not supported by Core Audio and no external FFmpeg binary is configured.")
+        }
+
+        try decodeViaExternalProcess(
+            mediaPath: mediaPath,
+            binPath: binPath,
+            capabilities: caps,
+            audioStreamIndex: streamIdx,
+            targetSampleRate: sampleRate,
+            sink: sink
+        )
+    }
+
+    private static func decodeViaCoreAudio(
+        audioFile: AVAudioFile,
+        targetSampleRate: Int,
+        sink: FLACFrameSink
+    ) throws {
+        guard let targetFmt = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: Double(targetSampleRate),
+            channels: 2,
+            interleaved: true
+        ), let converter = AVAudioConverter(from: audioFile.processingFormat, to: targetFmt),
+           let inBuf = AVAudioPCMBuffer(pcmFormat: audioFile.processingFormat, frameCapacity: 4096),
+           let outBuf = AVAudioPCMBuffer(pcmFormat: targetFmt, frameCapacity: 8192) else {
+            throw ExportError.decodeFailed("Core Audio could not initialize converter for FLAC export.")
+        }
+
+        var fileEOF = false
+        var reachedEOF = false
+        while !reachedEOF {
+            if sink.token.isCancelled { throw ExportError.cancelled }
+            var convErr: NSError?
+            let status = converter.convert(to: outBuf, error: &convErr) { _, outStatus in
+                if fileEOF {
+                    outStatus.pointee = .endOfStream
+                    return nil
+                }
+                do {
+                    try audioFile.read(into: inBuf, frameCount: 4096)
+                    if inBuf.frameLength == 0 {
+                        fileEOF = true
+                        outStatus.pointee = .endOfStream
+                        return nil
+                    }
+                    outStatus.pointee = .haveData
+                    return inBuf
+                } catch {
+                    fileEOF = true
+                    outStatus.pointee = .endOfStream
+                    return nil
+                }
+            }
+            if outBuf.frameLength > 0, let mData = outBuf.audioBufferList.pointee.mBuffers.mData {
+                let fPtr = mData.assumingMemoryBound(to: Float.self)
+                if !sink.writeInterleaved(fPtr, frameCount: Int(outBuf.frameLength)) {
+                    break
+                }
+            }
+            if status == .endOfStream || status == .error {
+                reachedEOF = true
+            }
+        }
+    }
+
+    private static func decodeViaExternalProcess(
+        mediaPath: String,
+        binPath: String,
+        capabilities: DecoderCapabilities,
+        audioStreamIndex: Int,
+        targetSampleRate: Int,
+        sink: FLACFrameSink
+    ) throws {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: binPath)
+
+        var args: [String] = [
+            "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", mediaPath,
+            "-map", "0:a:\(audioStreamIndex)",
+            "-vn", "-sn", "-dn"
+        ]
+        if capabilities.hasAresampleFilter {
+            args += ["-ar", "\(targetSampleRate)", "-ac", "2"]
+        }
+
+        let errPipe = Pipe()
+        proc.standardError = errPipe
+        let mode = capabilities.pipeMode
+
+        if capabilities.hasPipeProtocol {
+            switch mode {
+            case .wav(let pcmCodec):
+                if let pcmCodec { args += ["-c:a", pcmCodec] }
+                args += ["-f", "wav", "pipe:1"]
+            case .flac:
+                args += ["-c:a", "flac", "-compression_level", "0", "-f", "flac", "pipe:1"]
+            }
+            proc.arguments = args
+            let outPipe = Pipe()
+            proc.standardOutput = outPipe
+            try proc.run()
+            try consumeExternalOutput(
+                outFD: outPipe.fileHandleForReading.fileDescriptor,
+                errHandle: errPipe.fileHandleForReading,
+                proc: proc,
+                mode: mode,
+                targetSampleRate: targetSampleRate,
+                sink: sink
+            )
+            _ = outPipe
+        } else {
+            let fifoDir = FileManager.default.temporaryDirectory
+                .appendingPathComponent("ac4export_fifo_\(UUID().uuidString)")
+            try FileManager.default.createDirectory(
+                at: fifoDir,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            defer { try? FileManager.default.removeItem(at: fifoDir) }
+
+            let fifoPath = fifoDir.appendingPathComponent("export.fifo").path
+            guard Darwin.mkfifo(fifoPath, mode_t(S_IRUSR | S_IWUSR)) == 0 else {
+                throw ExportError.decodeFailed("Could not create POSIX FIFO for external decoder.")
+            }
+
+            switch mode {
+            case .wav(let pcmCodec):
+                if let pcmCodec { args += ["-c:a", pcmCodec] }
+                args += ["-f", "wav", fifoPath]
+            case .flac:
+                args += ["-c:a", "flac", "-compression_level", "0", "-f", "flac", fifoPath]
+            }
+            proc.arguments = args
+            proc.standardOutput = FileHandle.nullDevice
+            proc.terminationHandler = { _ in
+                let wakeFD = Darwin.open(fifoPath, O_WRONLY | O_NONBLOCK)
+                if wakeFD >= 0 { Darwin.close(wakeFD) }
+            }
+
+            try proc.run()
+            let outFD = Darwin.open(fifoPath, O_RDONLY)
+            guard outFD >= 0 else {
+                if proc.isRunning { proc.terminate() }
+                throw ExportError.decodeFailed("Failed to open decoder FIFO.")
+            }
+            defer { Darwin.close(outFD) }
+
+            try consumeExternalOutput(
+                outFD: outFD,
+                errHandle: errPipe.fileHandleForReading,
+                proc: proc,
+                mode: mode,
+                targetSampleRate: targetSampleRate,
+                sink: sink
+            )
+        }
+    }
+
+    private static func consumeExternalOutput(
+        outFD: Int32,
+        errHandle: FileHandle,
+        proc: Process,
+        mode: PipeStreamMode,
+        targetSampleRate: Int,
+        sink: FLACFrameSink
+    ) throws {
+        switch mode {
+        case .wav:
+            guard let wavFmt = AC4AudioEngine.parseWAVHeader(fd: outFD) else {
+                let errData = errHandle.readDataToEndOfFile()
+                proc.waitUntilExit()
+                let msg = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                throw ExportError.decodeFailed(msg.isEmpty ? "External LibreMPEG failed to decode audio stream." : msg)
+            }
+
+            let bytesPerSample = wavFmt.bitsPerSample / 8
+            let bytesPerFrame = wavFmt.channels * bytesPerSample
+            let chunkFrames = 4096
+            let maxBytes = chunkFrames * bytesPerFrame
+            let rawBuf = UnsafeMutableRawPointer.allocate(byteCount: maxBytes, alignment: 8)
+            let stereoOut = UnsafeMutablePointer<Float>.allocate(capacity: chunkFrames * 8)
+            defer {
+                rawBuf.deallocate()
+                stereoOut.deallocate()
+            }
+
+            let needsResample = (wavFmt.sampleRate != targetSampleRate)
+            let stepRatio = Double(wavFmt.sampleRate) / Double(targetSampleRate)
+            var resamplePos = 0.0
+            var prevL: Float = 0
+            var prevR: Float = 0
+            var hasPrev = false
+            var carryBytes = 0
+
+            while true {
+                if sink.token.isCancelled {
+                    if proc.isRunning { proc.terminate() }
+                    throw ExportError.cancelled
+                }
+                let n = Darwin.read(outFD, rawBuf.advanced(by: carryBytes), maxBytes - carryBytes)
+                if n > 0 {
+                    let totalBytes = carryBytes + n
+                    let wholeFrames = totalBytes / bytesPerFrame
+                    let leftover = totalBytes % bytesPerFrame
+
+                    if wholeFrames > 0 {
+                        if wavFmt.isFloat && wavFmt.bitsPerSample == 32 && wavFmt.channels == 2 && !needsResample {
+                            let fPtr = rawBuf.assumingMemoryBound(to: Float.self)
+                            if !sink.writeInterleaved(fPtr, frameCount: wholeFrames) {
+                                if proc.isRunning { proc.terminate() }
+                                break
+                            }
+                        } else if !needsResample {
+                            for f in 0..<wholeFrames {
+                                let base = rawBuf.advanced(by: f * bytesPerFrame)
+                                let sL = AC4AudioEngine.decodePCMSample(base, isFloat: wavFmt.isFloat, bits: wavFmt.bitsPerSample)
+                                let sR = wavFmt.channels >= 2
+                                    ? AC4AudioEngine.decodePCMSample(base.advanced(by: bytesPerSample), isFloat: wavFmt.isFloat, bits: wavFmt.bitsPerSample)
+                                    : sL
+                                stereoOut[f * 2] = sL
+                                stereoOut[f * 2 + 1] = sR
+                            }
+                            if !sink.writeInterleaved(stereoOut, frameCount: wholeFrames) {
+                                if proc.isRunning { proc.terminate() }
+                                break
+                            }
+                        } else {
+                            var outCount = 0
+                            let maxOut = chunkFrames * 4
+                            for f in 0..<wholeFrames {
+                                let base = rawBuf.advanced(by: f * bytesPerFrame)
+                                let curL = AC4AudioEngine.decodePCMSample(base, isFloat: wavFmt.isFloat, bits: wavFmt.bitsPerSample)
+                                let curR = wavFmt.channels >= 2
+                                    ? AC4AudioEngine.decodePCMSample(base.advanced(by: bytesPerSample), isFloat: wavFmt.isFloat, bits: wavFmt.bitsPerSample)
+                                    : curL
+                                if !hasPrev {
+                                    prevL = curL
+                                    prevR = curR
+                                    hasPrev = true
+                                }
+                                while resamplePos < 1.0 && outCount < maxOut {
+                                    let frac = Float(resamplePos)
+                                    stereoOut[outCount * 2] = prevL + (curL - prevL) * frac
+                                    stereoOut[outCount * 2 + 1] = prevR + (curR - prevR) * frac
+                                    outCount += 1
+                                    resamplePos += stepRatio
+                                }
+                                resamplePos -= 1.0
+                                prevL = curL
+                                prevR = curR
+                            }
+                            if outCount > 0, !sink.writeInterleaved(stereoOut, frameCount: outCount) {
+                                if proc.isRunning { proc.terminate() }
+                                break
+                            }
+                        }
+                    }
+                    if leftover > 0 {
+                        memmove(rawBuf, rawBuf.advanced(by: wholeFrames * bytesPerFrame), leftover)
+                    }
+                    carryBytes = leftover
+                } else if n == 0 {
+                    break
+                } else {
+                    if errno == EINTR { continue }
+                    break
+                }
+            }
+
+            let errData = errHandle.readDataToEndOfFile()
+            proc.waitUntilExit()
+            if sink.token.isCancelled { throw ExportError.cancelled }
+            if sink.framesWritten == 0, proc.terminationStatus != 0 {
+                let msg = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                throw ExportError.decodeFailed(msg.isEmpty ? "External LibreMPEG decode failed." : msg)
+            }
+
+        case .flac:
+            var flacData = Data()
+            let chunk = UnsafeMutableRawPointer.allocate(byteCount: 65_536, alignment: 1)
+            defer { chunk.deallocate() }
+            while flacData.count < 512 * 1024 * 1024 {
+                if sink.token.isCancelled {
+                    if proc.isRunning { proc.terminate() }
+                    throw ExportError.cancelled
+                }
+                let n = Darwin.read(outFD, chunk, 65_536)
+                if n > 0 {
+                    flacData.append(chunk.assumingMemoryBound(to: UInt8.self), count: n)
+                } else if n == 0 {
+                    break
+                } else if errno != EINTR {
+                    break
+                }
+            }
+            let errData = errHandle.readDataToEndOfFile()
+            proc.waitUntilExit()
+            guard !flacData.isEmpty else {
+                let msg = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                throw ExportError.decodeFailed(msg.isEmpty ? "External FLAC pipe returned no audio." : msg)
+            }
+            let tmpPipeFLAC = FileManager.default.temporaryDirectory
+                .appendingPathComponent("ac4_extpipe_\(UUID().uuidString).flac")
+            defer { try? FileManager.default.removeItem(at: tmpPipeFLAC) }
+            try flacData.write(to: tmpPipeFLAC, options: .atomic)
+            flacData.removeAll(keepingCapacity: false)
+            let audioFile = try AVAudioFile(forReading: tmpPipeFLAC)
+            try decodeViaCoreAudio(audioFile: audioFile, targetSampleRate: targetSampleRate, sink: sink)
+        }
+    }
+
+    // MARK: RFC 9639 Metadata & Picture Block Splicer
+
+    private static func writeTaggedFLAC(
+        rawFLACURL: URL,
+        stagingURL: URL,
+        metadata: RichMetadataBundle,
+        token: ExportCancellationToken
+    ) throws {
+        let inHandle = try FileHandle(forReadingFrom: rawFLACURL)
+        defer { try? inHandle.close() }
+
+        let fileSize = try inHandle.seekToEnd()
+        guard fileSize > 42 else { throw ExportError.invalidFLACOutput }
+        try inHandle.seek(toOffset: 0)
+
+        guard let magic = try inHandle.read(upToCount: 4),
+              magic == Data([0x66, 0x4C, 0x61, 0x43]) else { // "fLaC"
+            throw ExportError.invalidFLACOutput
+        }
+
+        // Keep STREAMINFO (0) first as required by RFC 9639 §8.1, plus SEEKTABLE (3) if present.
+        // Replace Core Audio's minimal VORBIS_COMMENT (4) with our complete metadata block.
+        var blocksToWrite: [(type: UInt8, payload: Data)] = []
+        var offset: UInt64 = 4
+        var foundLast = false
+
+        while offset + 4 <= fileSize {
+            try inHandle.seek(toOffset: offset)
+            guard let hdr = try inHandle.read(upToCount: 4), hdr.count == 4 else {
+                throw ExportError.invalidFLACOutput
+            }
+            let isLast = (hdr[hdr.startIndex] & 0x80) != 0
+            let blockType = hdr[hdr.startIndex] & 0x7F
+            let blockLen = (UInt64(hdr[hdr.startIndex + 1]) << 16)
+                | (UInt64(hdr[hdr.startIndex + 2]) << 8)
+                | UInt64(hdr[hdr.startIndex + 3])
+
+            guard offset + 4 + blockLen <= fileSize else {
+                throw ExportError.invalidFLACOutput
+            }
+
+            if blockType == 0 || blockType == 3 {
+                let payload = (blockLen > 0) ? (try inHandle.read(upToCount: Int(blockLen)) ?? Data()) : Data()
+                guard payload.count == Int(blockLen) else { throw ExportError.invalidFLACOutput }
+                blocksToWrite.append((type: blockType, payload: payload))
+            }
+
+            offset += 4 + blockLen
+            if isLast {
+                foundLast = true
+                break
+            }
+        }
+
+        guard foundLast, let firstBlock = blocksToWrite.first, firstBlock.type == 0, firstBlock.payload.count == 34 else {
+            throw ExportError.invalidFLACOutput
+        }
+        let audioFramesOffset = offset
+
+        // Build VORBIS_COMMENT block (type 4, little-endian 32-bit lengths per RFC 9639 §8.6)
+        let vorbisPayload = buildVorbisCommentPayload(comments: metadata.comments)
+        if vorbisPayload.count <= 0xFFFFFF {
+            blocksToWrite.append((type: 4, payload: vorbisPayload))
+        }
+
+        // Build METADATA_BLOCK_PICTURE block(s) (type 6, big-endian 32-bit fields per RFC 9639 §8.8)
+        for pic in metadata.pictures {
+            let picPayload = buildPicturePayload(pic)
+            if picPayload.count <= 0xFFFFFF {
+                blocksToWrite.append((type: 6, payload: picPayload))
+            }
+        }
+
+        // Add 4 KB PADDING block (type 1) so future tag edits never need to rewrite audio frames
+        blocksToWrite.append((type: 1, payload: Data(repeating: 0, count: 4096)))
+
+        FileManager.default.createFile(atPath: stagingURL.path, contents: nil, attributes: nil)
+        let outHandle = try FileHandle(forWritingTo: stagingURL)
+        defer { try? outHandle.close() }
+
+        try outHandle.write(contentsOf: Data([0x66, 0x4C, 0x61, 0x43]))
+        for (idx, blk) in blocksToWrite.enumerated() {
+            let isLast = (idx == blocksToWrite.count - 1)
+            let len = blk.payload.count
+            let header = Data([
+                (isLast ? 0x80 : 0x00) | (blk.type & 0x7F),
+                UInt8((len >> 16) & 0xFF),
+                UInt8((len >> 8) & 0xFF),
+                UInt8(len & 0xFF)
+            ])
+            try outHandle.write(contentsOf: header)
+            try outHandle.write(contentsOf: blk.payload)
+        }
+
+        // Stream-copy FLAC audio frames in 256 KB chunks
+        try inHandle.seek(toOffset: audioFramesOffset)
+        while true {
+            if token.isCancelled { throw ExportError.cancelled }
+            guard let chunk = try inHandle.read(upToCount: 262_144), !chunk.isEmpty else {
+                break
+            }
+            try outHandle.write(contentsOf: chunk)
+        }
+        try outHandle.synchronize()
+    }
+
+    private static func buildVorbisCommentPayload(comments: [(key: String, value: String)]) -> Data {
+        let vendorBytes = Array("AC-4 Player".utf8)
+        var validEntries: [[UInt8]] = []
+        validEntries.reserveCapacity(comments.count)
+
+        for (key, value) in comments {
+            let entryBytes = Array("\(key)=\(value)".utf8)
+            if !entryBytes.isEmpty && entryBytes.count <= 1_048_576 {
+                validEntries.append(entryBytes)
+            }
+        }
+
+        var out = Data()
+        out.reserveCapacity(8 + vendorBytes.count + validEntries.reduce(0) { $0 + 4 + $1.count })
+        appendUInt32LE(UInt32(vendorBytes.count), to: &out)
+        out.append(contentsOf: vendorBytes)
+        appendUInt32LE(UInt32(validEntries.count), to: &out)
+        for entry in validEntries {
+            appendUInt32LE(UInt32(entry.count), to: &out)
+            out.append(contentsOf: entry)
+        }
+        return out
+    }
+
+    private static func buildPicturePayload(_ pic: EmbeddedPicture) -> Data {
+        let mimeBytes = Array(pic.mimeType.utf8)
+        var out = Data()
+        out.reserveCapacity(32 + mimeBytes.count + pic.data.count)
+        appendUInt32BE(pic.pictureType, to: &out)
+        appendUInt32BE(UInt32(mimeBytes.count), to: &out)
+        out.append(contentsOf: mimeBytes)
+        appendUInt32BE(0, to: &out) // description length = 0
+        appendUInt32BE(pic.width, to: &out)
+        appendUInt32BE(pic.height, to: &out)
+        appendUInt32BE(pic.colorDepth, to: &out)
+        appendUInt32BE(0, to: &out) // indexed-color palette count = 0
+        appendUInt32BE(UInt32(pic.data.count), to: &out)
+        out.append(pic.data)
+        return out
+    }
+
+    private static func appendUInt32LE(_ v: UInt32, to data: inout Data) {
+        data.append(UInt8(v & 0xFF))
+        data.append(UInt8((v >> 8) & 0xFF))
+        data.append(UInt8((v >> 16) & 0xFF))
+        data.append(UInt8((v >> 24) & 0xFF))
+    }
+
+    private static func appendUInt32BE(_ v: UInt32, to data: inout Data) {
+        data.append(UInt8((v >> 24) & 0xFF))
+        data.append(UInt8((v >> 16) & 0xFF))
+        data.append(UInt8((v >> 8) & 0xFF))
+        data.append(UInt8(v & 0xFF))
     }
 }
 
@@ -2176,9 +3755,16 @@ final class PlayerViewModel: ObservableObject {
     @Published var errorBanner: String?
     @Published var isDropTargeted: Bool = false
 
+    @Published private(set) var isExportingFLAC: Bool = false
+    @Published private(set) var exportProgress: Double = 0.0
+    @Published private(set) var exportStatusBanner: String?
+    @Published private(set) var lastExportedURLs: [URL] = []
+
     private let audioEngine = AC4AudioEngine()
     private var progressTimer: Timer?
     private var remoteCommandsConfigured = false
+    private var activeExportToken: ExportCancellationToken?
+    private var activeExportTask: Task<Void, Never>?
 
     init() {
         let savedVol = UserDefaults.standard.object(forKey: PlayerConstants.volumeDefaultsKey) as? Double
@@ -2429,6 +4015,159 @@ final class PlayerViewModel: ObservableObject {
         tracks.removeAll()
         selectedTrackID = nil
         persistLibrary()
+    }
+
+    // MARK: - Lossless In-Place FLAC Export
+
+    var exportableTracks: [AudioTrack] {
+        tracks.filter { $0.url.pathExtension.lowercased() != "flac" }
+    }
+
+    var selectedOrCurrentTrack: AudioTrack? {
+        if let selID = selectedTrackID, let sel = tracks.first(where: { $0.id == selID }) {
+            return sel
+        }
+        return currentTrack
+    }
+
+    func exportTrackAsFLAC(_ track: AudioTrack) {
+        if track.url.pathExtension.lowercased() == "flac" {
+            errorBanner = "'\(track.url.lastPathComponent)' is already a FLAC file."
+            return
+        }
+        runFLACExportQueue([track])
+    }
+
+    func exportSelectedTrackAsFLAC() {
+        guard let target = selectedOrCurrentTrack else { return }
+        exportTrackAsFLAC(target)
+    }
+
+    func exportAllTracksAsFLAC() {
+        let targets = exportableTracks
+        guard !targets.isEmpty else {
+            errorBanner = "All tracks in the library are already FLAC files."
+            return
+        }
+        runFLACExportQueue(targets)
+    }
+
+    func cancelFLACExport() {
+        activeExportToken?.cancel()
+        activeExportTask?.cancel()
+        activeExportToken = nil
+        activeExportTask = nil
+        isExportingFLAC = false
+        exportProgress = 0.0
+        exportStatusBanner = nil
+    }
+
+    func dismissExportBanner() {
+        exportStatusBanner = nil
+        lastExportedURLs = []
+    }
+
+    private func runFLACExportQueue(_ queue: [AudioTrack]) {
+        guard !isExportingFLAC, !queue.isEmpty else { return }
+
+        if queue.contains(where: \.isAC4) && !decoderStatus.isAC4Capable {
+            if let binPath = decoderStatus.activeBinaryPath {
+                errorBanner = "Selected FFmpeg (\(URL(fileURLWithPath: binPath).lastPathComponent)) lacks the 'ac4' decoder. Point AC-4 Player to your LibreMPEG binary or rebuild with ./librempeg."
+            } else if case .notFound(let reason) = decoderStatus {
+                errorBanner = reason
+            } else {
+                errorBanner = "AC-4 decoder not configured. Rebuild with ./librempeg or choose 'Locate LibreMPEG Binary…' from the File menu."
+            }
+            return
+        }
+
+        errorBanner = nil
+        lastExportedURLs = []
+        isExportingFLAC = true
+        exportProgress = 0.0
+
+        let token = ExportCancellationToken()
+        activeExportToken = token
+        let statusSnapshot = decoderStatus
+        let totalCount = queue.count
+
+        activeExportTask = Task { [weak self] in
+            var exportedURLs: [URL] = []
+            var firstFailure: String?
+
+            for (index, item) in queue.enumerated() {
+                if token.isCancelled || Task.isCancelled { break }
+                let targetName = FLACExporter.destinationURL(for: item.url).lastPathComponent
+                let prefix = totalCount > 1 ? "Exporting \(index + 1)/\(totalCount): " : "Exporting "
+                self?.exportStatusBanner = "\(prefix)\(targetName)…"
+                self?.exportProgress = Double(index) / Double(totalCount)
+
+                let reportProgress: @MainActor @Sendable (Double, Int) -> Void = { [weak self] overall, pct in
+                    guard let self, self.activeExportToken === token else { return }
+                    self.exportProgress = overall
+                    self.exportStatusBanner = "\(prefix)\(targetName) (\(pct)%)"
+                }
+
+                let result: Result<URL, Error> = await Task.detached(priority: .userInitiated) {
+                    Result {
+                        try FLACExporter.exportInPlace(
+                            track: item,
+                            decoderStatus: statusSnapshot,
+                            token: token,
+                            onProgress: { trackFraction in
+                                let overall = (Double(index) + trackFraction) / Double(totalCount)
+                                let pct = Int((trackFraction * 100.0).rounded())
+                                Task { @MainActor in
+                                    reportProgress(overall, pct)
+                                }
+                            }
+                        )
+                    }
+                }.value
+
+                switch result {
+                case .success(let outURL):
+                    exportedURLs.append(outURL)
+                case .failure(let err):
+                    if token.isCancelled || (err as? FLACExporter.ExportError) != nil && "\(err)" == "cancelled" {
+                        break
+                    }
+                    if case FLACExporter.ExportError.cancelled = err {
+                        break
+                    }
+                    firstFailure = "FLAC export failed for '\(item.url.lastPathComponent)': \(err.localizedDescription)"
+                    break
+                }
+            }
+
+            guard let self, self.activeExportToken === token else { return }
+            self.activeExportToken = nil
+            self.activeExportTask = nil
+            self.isExportingFLAC = false
+            self.exportProgress = 0.0
+
+            if token.isCancelled {
+                self.exportStatusBanner = nil
+                return
+            }
+
+            if let firstFailure {
+                self.errorBanner = firstFailure
+                if exportedURLs.isEmpty {
+                    self.exportStatusBanner = nil
+                    return
+                }
+            }
+
+            self.lastExportedURLs = exportedURLs
+            if exportedURLs.count == 1, let single = exportedURLs.first {
+                self.exportStatusBanner = "Exported \(single.lastPathComponent) in place."
+            } else if exportedURLs.count > 1 {
+                self.exportStatusBanner = "Exported \(exportedURLs.count) tracks as FLAC in place."
+            } else {
+                self.exportStatusBanner = nil
+            }
+        }
     }
 
     // MARK: - Transport Controls
@@ -2828,6 +4567,48 @@ struct MainLibraryView: View {
                 .background(Color.red.opacity(0.15))
             }
 
+            if let exportText = vm.exportStatusBanner {
+                HStack(spacing: 10) {
+                    if vm.isExportingFLAC {
+                        ProgressView(value: vm.exportProgress, total: 1.0)
+                            .progressViewStyle(.linear)
+                            .frame(width: 96)
+                        Text(exportText)
+                            .font(.caption)
+                            .lineLimit(1)
+                        Spacer()
+                        Button("Cancel") {
+                            vm.cancelFLACExport()
+                        }
+                        .buttonStyle(.borderless)
+                        .font(.caption.weight(.semibold))
+                    } else {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                        Text(exportText)
+                            .font(.caption)
+                            .lineLimit(1)
+                        Spacer()
+                        if !vm.lastExportedURLs.isEmpty {
+                            Button("Show in Finder") {
+                                NSWorkspace.shared.activateFileViewerSelecting(vm.lastExportedURLs)
+                            }
+                            .buttonStyle(.borderless)
+                            .font(.caption.weight(.semibold))
+                        }
+                        Button("Dismiss") {
+                            vm.dismissExportBanner()
+                        }
+                        .buttonStyle(.borderless)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(vm.isExportingFLAC ? Color.accentColor.opacity(0.10) : Color.green.opacity(0.12))
+            }
+
             if vm.tracks.isEmpty {
                 EmptyLibraryDropView(vm: vm)
             } else {
@@ -2920,6 +4701,15 @@ struct TrackListHeaderBar: View {
             Spacer()
             if !vm.tracks.isEmpty {
                 Button {
+                    vm.exportAllTracksAsFLAC()
+                } label: {
+                    Label("Export All as FLAC", systemImage: "square.and.arrow.down")
+                }
+                .controlSize(.small)
+                .disabled(vm.isExportingFLAC || vm.exportableTracks.isEmpty)
+                .help("Export all tracks in place as 24-bit lossless FLAC preserving all metadata and artwork")
+
+                Button {
                     if let first = vm.tracks.first {
                         vm.playTrack(first)
                     }
@@ -2957,6 +4747,10 @@ struct TrackTableView: View {
                     Button("Play") {
                         vm.playTrack(track)
                     }
+                    Button("Export as FLAC") {
+                        vm.exportTrackAsFLAC(track)
+                    }
+                    .disabled(vm.isExportingFLAC || track.url.pathExtension.lowercased() == "flac")
                     Button("Reveal in Finder") {
                         NSWorkspace.shared.activateFileViewerSelecting([track.url])
                     }
@@ -3301,6 +5095,26 @@ struct AC4PlayerApp: App {
                     viewModel.pickAudioFilesOrFolders()
                 }
                 .keyboardShortcut("o", modifiers: [.command])
+
+                Divider()
+
+                Button("Export Selected as FLAC") {
+                    viewModel.exportSelectedTrackAsFLAC()
+                }
+                .keyboardShortcut("e", modifiers: [.command])
+                .disabled(
+                    viewModel.isExportingFLAC
+                        || viewModel.selectedOrCurrentTrack == nil
+                        || viewModel.selectedOrCurrentTrack?.url.pathExtension.lowercased() == "flac"
+                )
+
+                Button("Export All as FLAC") {
+                    viewModel.exportAllTracksAsFLAC()
+                }
+                .keyboardShortcut("e", modifiers: [.command, .shift])
+                .disabled(viewModel.isExportingFLAC || viewModel.exportableTracks.isEmpty)
+
+                Divider()
 
                 Button("Toggle +6 dB Pre-Amp Boost") {
                     viewModel.togglePreampBoost()

@@ -32,6 +32,12 @@ typedef struct AC4ProbeInfo {
 /// Return 1 to continue decoding, or 0 to abort immediately (e.g. on stop or seek).
 typedef int (*ac4_pcm_write_cb)(const float *interleaved_stereo, int frame_count, void *userdata);
 
+/// Callback invoked for each container/stream metadata tag `(key, value)` discovered by LibreMPEG.
+typedef void (*ac4_tag_cb)(const char *key, const char *value, void *userdata);
+
+/// Callback invoked for each embedded cover picture (`AV_DISPOSITION_ATTACHED_PIC`) discovered by LibreMPEG.
+typedef void (*ac4_artwork_cb)(const uint8_t *data, size_t size, const char *mime_type, void *userdata);
+
 /// Returns 1 if LibreMPEG's native `ac4` decoder is statically linked into this binary, 0 otherwise.
 int ac4_native_is_available(void);
 
@@ -43,6 +49,16 @@ int ac4_native_can_decode_file(const char *path, int preferred_audio_stream_inde
 
 /// Probes container/bitstream metadata and duration in-process without spawning a child process.
 int ac4_native_probe_file(const char *path, AC4ProbeInfo *out_info);
+
+/// Enumerates all container/audio-stream metadata tags and attached cover pictures in-process.
+/// Returns 1 if the container was opened and inspected, or 0 if unsupported/unavailable.
+int ac4_native_extract_metadata(
+    const char *path,
+    int preferred_audio_stream_index,
+    ac4_tag_cb tag_cb,
+    ac4_artwork_cb artwork_cb,
+    void *userdata
+);
 
 /// Decodes an audio stream in-process into 32-bit float stereo at `target_sample_rate` (e.g. 48000 Hz).
 /// Returns 0 on clean EOF or caller-requested cancellation, or negative error code on decode failure.

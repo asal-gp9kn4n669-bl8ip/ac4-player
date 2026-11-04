@@ -296,6 +296,8 @@ echo "==> Compiling AC4 Player.app..."
     -framework SwiftUI \
     -framework AppKit \
     -framework AVFoundation \
+    -framework AudioToolbox \
+    -framework ImageIO \
     -framework MediaPlayer \
     -framework UniformTypeIdentifiers \
     "$SCRIPT_DIR/AC4PlayerApp.swift" \

@@ -433,6 +433,106 @@ int ac4_native_probe_file(const char *path, AC4ProbeInfo *out_info) {
     return 1;
 }
 
+static int is_container_housekeeping_key(const char *key, const char *val) {
+    if (!key || key[0] == '\0') return 1;
+    if (strcasecmp(key, "major_brand") == 0
+        || strcasecmp(key, "minor_version") == 0
+        || strcasecmp(key, "compatible_brands") == 0
+        || strcasecmp(key, "handler_name") == 0
+        || strcasecmp(key, "vendor_id") == 0
+        || strcasecmp(key, "creation_time") == 0) {
+        return 1;
+    }
+    if (strcasecmp(key, "encoder") == 0 && val && strncasecmp(val, "Lavf", 4) == 0) {
+        return 1;
+    }
+    return 0;
+}
+
+static const char *detect_image_mime(const uint8_t *buf, size_t len, enum AVCodecID cid) {
+    if (buf && len >= 4) {
+        if (buf[0] == 0xFF && buf[1] == 0xD8 && buf[2] == 0xFF) {
+            return "image/jpeg";
+        }
+        if (buf[0] == 0x89 && buf[1] == 0x50 && buf[2] == 0x4E && buf[3] == 0x47) {
+            return "image/png";
+        }
+        if (buf[0] == 0x47 && buf[1] == 0x49 && buf[2] == 0x46 && buf[3] == 0x38) {
+            return "image/gif";
+        }
+        if (len >= 12
+            && buf[0] == 'R' && buf[1] == 'I' && buf[2] == 'F' && buf[3] == 'F'
+            && buf[8] == 'W' && buf[9] == 'E' && buf[10] == 'B' && buf[11] == 'P') {
+            return "image/webp";
+        }
+    }
+    if (cid == AV_CODEC_ID_PNG) return "image/png";
+    if (cid == AV_CODEC_ID_GIF) return "image/gif";
+    if (cid == AV_CODEC_ID_WEBP) return "image/webp";
+    return "image/jpeg";
+}
+
+int ac4_native_extract_metadata(
+    const char *path,
+    int preferred_audio_stream_index,
+    ac4_tag_cb tag_cb,
+    ac4_artwork_cb artwork_cb,
+    void *userdata
+) {
+    if (!path || path[0] != '/') return 0;
+    ensure_av_initialized();
+
+    AVFormatContext *fmt = NULL;
+    if (avformat_open_input(&fmt, path, NULL, NULL) != 0) {
+        return 0;
+    }
+    if (avformat_find_stream_info(fmt, NULL) < 0) {
+        avformat_close_input(&fmt);
+        return 0;
+    }
+
+    if (tag_cb && fmt->metadata) {
+        const AVDictionaryEntry *e = NULL;
+        while ((e = av_dict_iterate(fmt->metadata, e)) != NULL) {
+            if (e->key && e->value && e->value[0] != '\0' && !is_container_housekeeping_key(e->key, e->value)) {
+                tag_cb(e->key, e->value, userdata);
+            }
+        }
+    }
+
+    int st_idx = select_audio_stream(fmt, preferred_audio_stream_index, NULL);
+    if (tag_cb && st_idx >= 0 && fmt->streams[st_idx] && fmt->streams[st_idx]->metadata) {
+        const AVDictionary *smd = fmt->streams[st_idx]->metadata;
+        const AVDictionaryEntry *e = NULL;
+        while ((e = av_dict_iterate(smd, e)) != NULL) {
+            if (e->key && e->value && e->value[0] != '\0' && !is_container_housekeeping_key(e->key, e->value)) {
+                tag_cb(e->key, e->value, userdata);
+            }
+        }
+    }
+
+    if (artwork_cb) {
+        for (unsigned int i = 0; i < fmt->nb_streams; i++) {
+            AVStream *st = fmt->streams[i];
+            if (!st) continue;
+            if ((st->disposition & AV_DISPOSITION_ATTACHED_PIC) != 0
+                && st->attached_pic.data != NULL
+                && st->attached_pic.size > 0) {
+                enum AVCodecID cid = st->codecpar ? st->codecpar->codec_id : AV_CODEC_ID_NONE;
+                const char *mime = detect_image_mime(
+                    st->attached_pic.data,
+                    (size_t)st->attached_pic.size,
+                    cid
+                );
+                artwork_cb(st->attached_pic.data, (size_t)st->attached_pic.size, mime, userdata);
+            }
+        }
+    }
+
+    avformat_close_input(&fmt);
+    return 1;
+}
+
 typedef struct OutputResampler {
     SwrContext *swr;
     int src_rate;
@@ -888,6 +988,21 @@ int ac4_native_probe_file(const char *path, AC4ProbeInfo *out_info) {
     if (out_info) {
         memset(out_info, 0, sizeof(*out_info));
     }
+    return 0;
+}
+
+int ac4_native_extract_metadata(
+    const char *path,
+    int preferred_audio_stream_index,
+    ac4_tag_cb tag_cb,
+    ac4_artwork_cb artwork_cb,
+    void *userdata
+) {
+    (void)path;
+    (void)preferred_audio_stream_index;
+    (void)tag_cb;
+    (void)artwork_cb;
+    (void)userdata;
     return 0;
 }
 
