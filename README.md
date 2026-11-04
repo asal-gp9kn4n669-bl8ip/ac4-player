@@ -1,4 +1,4 @@
-# AC4 Player
+# AC-4 Player
 
 A lightweight native **macOS (SwiftUI + Core Audio)** music player for playing **Dolby AC-4 IMS** (`.m4a`, `.mp4`, `.ac4`, `.mka`, `.mkv`) and standard audio files (`.flac`, `.wav`, `.opus`, `.mp3`) **directly in RAM** via [**LibreMPEG**](https://github.com/librempeg/librempeg).
 
