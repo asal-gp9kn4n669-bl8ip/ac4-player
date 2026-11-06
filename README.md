@@ -2,6 +2,8 @@
 
 A lightweight native **macOS (SwiftUI + Core Audio)** music player for playing **Dolby AC-4 IMS** (`.m4a`, `.mp4`, `.ac4`, `.mka`, `.mkv`) and standard audio files (`.flac`, `.wav`, `.opus`, `.mp3`) **directly in RAM** via [**LibreMPEG**](https://github.com/librempeg/librempeg).
 
+<img width="1575" height="1064" alt="Screenshot 2026-11-06 at 10 43 13 AM" src="https://github.com/user-attachments/assets/ea6485cf-78be-44ed-907f-36857533b973" />
+
 ---
 
 ## How It Works
