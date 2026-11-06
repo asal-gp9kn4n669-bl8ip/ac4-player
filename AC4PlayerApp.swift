@@ -25,11 +25,23 @@ private enum PlayerConstants {
         "ac4", "m4a", "mp4", "mka", "mkv", "mov",
         "flac", "wav", "opus", "ogg", "mp3", "aiff", "aif"
     ]
+    static let eqProfileExtensions: Set<String> = ["txt", "eq"]
+    static let maxEQBands: Int = 16
 
     static let customDecoderDefaultsKey = "AC4Player.customDecoderPath"
     static let savedTrackPathsDefaultsKey = "AC4Player.savedTrackPaths"
     static let volumeDefaultsKey = "AC4Player.volume"
     static let preampDefaultsKey = "AC4Player.preampDB"
+    static let autoGainDefaultsKey = "AC4Player.autoGainEnabled"
+    static let binauralWidthDefaultsKey = "AC4Player.binauralWidthPercent"
+    static let centerFocusDefaultsKey = "AC4Player.centerFocusDB"
+    static let eqEnabledDefaultsKey = "AC4Player.eqEnabled"
+    static let eqPreampDefaultsKey = "AC4Player.eqPreampDB"
+    static let eqBandsDefaultsKey = "AC4Player.eqBandsJSON"
+    static let savedEQProfilesDefaultsKey = "AC4Player.savedEQProfilesJSON"
+    static let selectedEQProfileIDDefaultsKey = "AC4Player.selectedEQProfileID"
+    static let showDSPPanelDefaultsKey = "AC4Player.showDSPPanel"
+    static let trackLevelCacheDefaultsKey = "AC4Player.trackLevelCacheJSON"
 }
 
 // MARK: - Models
@@ -196,6 +208,14 @@ struct AudioTrack: Identifiable, Hashable, Sendable {
         album.isEmpty ? "Unknown Album" : album
     }
 
+    var albumKey: String {
+        let cleaned = album.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if !cleaned.isEmpty {
+            return "album:\(cleaned)"
+        }
+        return "dir:\(url.deletingLastPathComponent().standardizedFileURL.path.lowercased())"
+    }
+
     var effectiveArtist: String {
         if !artist.isEmpty { return artist }
         if !albumArtist.isEmpty { return albumArtist }
@@ -214,6 +234,609 @@ enum TimeFormatting {
             return String(format: "%d:%02d:%02d", hrs, mins, secs)
         }
         return String(format: "%d:%02d", mins, secs)
+    }
+}
+
+// MARK: - Binaural Soundstage, Parametric EQ & AutoEQ (.txt) Models
+
+enum EQFilterType: String, CaseIterable, Codable, Sendable {
+    case peaking = "PK"
+    case lowShelf = "LSC"
+    case highShelf = "HSC"
+    case lowPass = "LPQ"
+    case highPass = "HPQ"
+    case notch = "NO"
+
+    var shortLabel: String {
+        switch self {
+        case .peaking: return "PK"
+        case .lowShelf: return "LS"
+        case .highShelf: return "HS"
+        case .lowPass: return "LP"
+        case .highPass: return "HP"
+        case .notch: return "NO"
+        }
+    }
+
+    var menuTitle: String {
+        switch self {
+        case .peaking: return "PK · Peaking Bell"
+        case .lowShelf: return "LS · Low Shelf"
+        case .highShelf: return "HS · High Shelf"
+        case .lowPass: return "LP · Low Pass"
+        case .highPass: return "HP · High Pass"
+        case .notch: return "NO · Notch"
+        }
+    }
+
+    var usesGain: Bool {
+        switch self {
+        case .peaking, .lowShelf, .highShelf: return true
+        case .lowPass, .highPass, .notch: return false
+        }
+    }
+}
+
+struct EQBand: Identifiable, Codable, Equatable, Sendable {
+    var id: UUID = UUID()
+    var isEnabled: Bool = true
+    var filterType: EQFilterType = .peaking
+    var frequencyHz: Double = 1000.0
+    var gainDB: Double = 0.0
+    var q: Double = 1.0
+}
+
+struct EQProfile: Identifiable, Codable, Equatable, Sendable {
+    var id: UUID = UUID()
+    var name: String
+    var preampDB: Double
+    var bands: [EQBand]
+    var isBuiltIn: Bool = false
+
+    static let builtInPresets: [EQProfile] = [
+        EQProfile(
+            id: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
+            name: "Flat (Reference)",
+            preampDB: 0.0,
+            bands: [
+                EQBand(isEnabled: true, filterType: .lowShelf, frequencyHz: 80, gainDB: 0.0, q: 0.71),
+                EQBand(isEnabled: true, filterType: .peaking, frequencyHz: 250, gainDB: 0.0, q: 1.00),
+                EQBand(isEnabled: true, filterType: .peaking, frequencyHz: 1000, gainDB: 0.0, q: 1.00),
+                EQBand(isEnabled: true, filterType: .peaking, frequencyHz: 3500, gainDB: 0.0, q: 1.40),
+                EQBand(isEnabled: true, filterType: .highShelf, frequencyHz: 10000, gainDB: 0.0, q: 0.71)
+            ],
+            isBuiltIn: true
+        ),
+        EQProfile(
+            id: UUID(uuidString: "00000000-0000-0000-0000-000000000002")!,
+            name: "Harman Bass & Warmth",
+            preampDB: -3.5,
+            bands: [
+                EQBand(isEnabled: true, filterType: .lowShelf, frequencyHz: 105, gainDB: 3.5, q: 0.71),
+                EQBand(isEnabled: true, filterType: .peaking, frequencyHz: 210, gainDB: -0.8, q: 1.20),
+                EQBand(isEnabled: true, filterType: .peaking, frequencyHz: 3200, gainDB: -1.2, q: 2.00),
+                EQBand(isEnabled: true, filterType: .highShelf, frequencyHz: 9500, gainDB: 1.0, q: 0.71)
+            ],
+            isBuiltIn: true
+        ),
+        EQProfile(
+            id: UUID(uuidString: "00000000-0000-0000-0000-000000000003")!,
+            name: "Binaural Pinna Glare Tamer",
+            preampDB: 0.0,
+            bands: [
+                EQBand(isEnabled: true, filterType: .lowShelf, frequencyHz: 85, gainDB: 1.2, q: 0.71),
+                EQBand(isEnabled: true, filterType: .peaking, frequencyHz: 3150, gainDB: -2.4, q: 2.20),
+                EQBand(isEnabled: true, filterType: .peaking, frequencyHz: 4800, gainDB: -1.8, q: 3.00),
+                EQBand(isEnabled: true, filterType: .highShelf, frequencyHz: 11000, gainDB: -0.8, q: 0.71)
+            ],
+            isBuiltIn: true
+        ),
+        EQProfile(
+            id: UUID(uuidString: "00000000-0000-0000-0000-000000000004")!,
+            name: "Binaural Vocal & Center Presence",
+            preampDB: -1.8,
+            bands: [
+                EQBand(isEnabled: true, filterType: .peaking, frequencyHz: 180, gainDB: -1.0, q: 1.30),
+                EQBand(isEnabled: true, filterType: .peaking, frequencyHz: 1650, gainDB: 1.8, q: 1.20),
+                EQBand(isEnabled: true, filterType: .peaking, frequencyHz: 3100, gainDB: 1.2, q: 1.80),
+                EQBand(isEnabled: true, filterType: .highShelf, frequencyHz: 10500, gainDB: 1.2, q: 0.71)
+            ],
+            isBuiltIn: true
+        ),
+        EQProfile(
+            id: UUID(uuidString: "00000000-0000-0000-0000-000000000005")!,
+            name: "Diffuse Field Air & Stage",
+            preampDB: -2.2,
+            bands: [
+                EQBand(isEnabled: true, filterType: .lowShelf, frequencyHz: 65, gainDB: 2.0, q: 0.71),
+                EQBand(isEnabled: true, filterType: .peaking, frequencyHz: 2000, gainDB: -1.2, q: 1.50),
+                EQBand(isEnabled: true, filterType: .highShelf, frequencyHz: 9000, gainDB: 2.4, q: 0.71)
+            ],
+            isBuiltIn: true
+        )
+    ]
+}
+
+/// Parses and serializes standard AutoEQ / EqualizerAPO / squig.link / Oratory1990 `.txt` Parametric EQ files.
+enum AutoEQParser {
+    static func parse(text: String, defaultName: String) -> EQProfile? {
+        var preampDB: Double = 0.0
+        var bands: [EQBand] = []
+
+        for rawLine in text.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.isEmpty || line.hasPrefix("#") || line.hasPrefix(";") || line.hasPrefix("//") {
+                continue
+            }
+
+            let lower = line.lowercased()
+            if lower.hasPrefix("preamp:") {
+                let after = line.dropFirst("preamp:".count)
+                    .replacingOccurrences(of: "db", with: "", options: .caseInsensitive)
+                    .replacingOccurrences(of: "+", with: "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let numToken = after.split(whereSeparator: { $0.isWhitespace }).first.map(String.init) ?? after
+                if let val = Double(numToken), val.isFinite {
+                    preampDB = max(-18.0, min(12.0, val))
+                }
+                continue
+            }
+
+            guard lower.hasPrefix("filter") else { continue }
+            guard let colonIdx = line.firstIndex(of: ":") else { continue }
+            let body = line[line.index(after: colonIdx)...]
+            let rawTokens = body
+                .replacingOccurrences(of: "\t", with: " ")
+                .split(whereSeparator: \.isWhitespace)
+                .map(String.init)
+            guard !rawTokens.isEmpty else { continue }
+
+            var idx = 0
+            var isEnabled = true
+            let firstUpper = rawTokens[0].uppercased()
+            if firstUpper == "ON" {
+                isEnabled = true
+                idx += 1
+            } else if firstUpper == "OFF" {
+                isEnabled = false
+                idx += 1
+            }
+            guard idx < rawTokens.count else { continue }
+
+            // Parse filter type token (handles single-token like PK/LSC/HSC and two-token like "LS 12dB")
+            let typeTok = rawTokens[idx].uppercased()
+            let filterType: EQFilterType
+            switch typeTok {
+            case "PK", "PEQ", "BELL", "PEAK":
+                filterType = .peaking
+                idx += 1
+            case "LS", "LSC", "LSH", "LOWSHELF", "LOW_SHELF":
+                filterType = .lowShelf
+                idx += 1
+                if idx < rawTokens.count, rawTokens[idx].lowercased().hasSuffix("db") {
+                    idx += 1
+                }
+            case "HS", "HSC", "HSH", "HIGHSHELF", "HIGH_SHELF":
+                filterType = .highShelf
+                idx += 1
+                if idx < rawTokens.count, rawTokens[idx].lowercased().hasSuffix("db") {
+                    idx += 1
+                }
+            case "LP", "LPQ", "LOWPASS", "LOW_PASS":
+                filterType = .lowPass
+                idx += 1
+            case "HP", "HPQ", "HIGHPASS", "HIGH_PASS":
+                filterType = .highPass
+                idx += 1
+            case "NO", "NOTCH":
+                filterType = .notch
+                idx += 1
+            case "NONE":
+                continue
+            default:
+                filterType = .peaking
+                idx += 1
+            }
+
+            var freqHz: Double?
+            var gainDB: Double = 0.0
+            var qVal: Double = (filterType == .lowShelf || filterType == .highShelf) ? 0.7071 : 1.0
+
+            while idx < rawTokens.count {
+                let tok = rawTokens[idx].uppercased()
+                if tok == "FC" || tok == "FREQ" || tok == "FREQUENCY" {
+                    if idx + 1 < rawTokens.count {
+                        let cleaned = rawTokens[idx + 1]
+                            .replacingOccurrences(of: ",", with: "")
+                            .replacingOccurrences(of: "hz", with: "", options: .caseInsensitive)
+                        if let f = Double(cleaned), f.isFinite {
+                            freqHz = max(20.0, min(20_000.0, f))
+                        }
+                        idx += 2
+                        if idx < rawTokens.count && rawTokens[idx].uppercased() == "HZ" {
+                            idx += 1
+                        }
+                        continue
+                    }
+                } else if tok == "GAIN" {
+                    if idx + 1 < rawTokens.count {
+                        let cleaned = rawTokens[idx + 1]
+                            .replacingOccurrences(of: "+", with: "")
+                            .replacingOccurrences(of: "db", with: "", options: .caseInsensitive)
+                        if let g = Double(cleaned), g.isFinite {
+                            gainDB = max(-18.0, min(18.0, g))
+                        }
+                        idx += 2
+                        if idx < rawTokens.count && rawTokens[idx].uppercased() == "DB" {
+                            idx += 1
+                        }
+                        continue
+                    }
+                } else if tok == "Q" {
+                    if idx + 1 < rawTokens.count {
+                        let cleaned = rawTokens[idx + 1].replacingOccurrences(of: ",", with: "")
+                        if let q = Double(cleaned), q.isFinite, q > 0.02 {
+                            qVal = max(0.10, min(18.0, q))
+                        }
+                        idx += 2
+                        continue
+                    }
+                } else if tok == "BW", idx + 2 < rawTokens.count, rawTokens[idx + 1].uppercased() == "OCT" {
+                    if let bw = Double(rawTokens[idx + 2]), bw > 0.05 && bw < 10.0 {
+                        let twoPow = pow(2.0, bw)
+                        let computedQ = sqrt(twoPow) / max(0.01, twoPow - 1.0)
+                        qVal = max(0.10, min(18.0, computedQ))
+                    }
+                    idx += 3
+                    continue
+                }
+                idx += 1
+            }
+
+            if let validFreq = freqHz, bands.count < PlayerConstants.maxEQBands {
+                bands.append(
+                    EQBand(
+                        isEnabled: isEnabled,
+                        filterType: filterType,
+                        frequencyHz: validFreq,
+                        gainDB: gainDB,
+                        q: qVal
+                    )
+                )
+            }
+        }
+
+        guard !bands.isEmpty else { return nil }
+        return EQProfile(
+            name: defaultName.isEmpty ? "Imported EQ" : defaultName,
+            preampDB: preampDB,
+            bands: bands,
+            isBuiltIn: false
+        )
+    }
+
+    static func serialize(preampDB: Double, bands: [EQBand]) -> String {
+        var lines: [String] = []
+        lines.append(String(format: "Preamp: %.1f dB", preampDB))
+        for (i, band) in bands.enumerated() {
+            let state = band.isEnabled ? "ON" : "OFF"
+            let fStr = band.frequencyHz >= 100
+                ? String(format: "%.0f", band.frequencyHz.rounded())
+                : String(format: "%.1f", band.frequencyHz)
+            if band.filterType.usesGain {
+                lines.append(
+                    String(
+                        format: "Filter %d: %@ %@ Fc %@ Hz Gain %.1f dB Q %.2f",
+                        i + 1,
+                        state,
+                        band.filterType.rawValue,
+                        fStr,
+                        band.gainDB,
+                        band.q
+                    )
+                )
+            } else {
+                lines.append(
+                    String(
+                        format: "Filter %d: %@ %@ Fc %@ Hz Q %.2f",
+                        i + 1,
+                        state,
+                        band.filterType.rawValue,
+                        fStr,
+                        band.q
+                    )
+                )
+            }
+        }
+        return lines.joined(separator: "\n") + "\n"
+    }
+}
+
+/// 64-bit RBJ Audio EQ Cookbook biquad coefficients for phase-locked stereo processing.
+struct BiquadCoeffs: Sendable {
+    var b0: Double = 1.0
+    var b1: Double = 0.0
+    var b2: Double = 0.0
+    var a1: Double = 0.0
+    var a2: Double = 0.0
+
+    static func make(band: EQBand, sampleRate: Double = PlayerConstants.sampleRate) -> BiquadCoeffs {
+        guard band.isEnabled else { return BiquadCoeffs() }
+        if band.filterType.usesGain && abs(band.gainDB) < 0.005 {
+            return BiquadCoeffs()
+        }
+
+        let f0 = max(15.0, min(sampleRate * 0.485, band.frequencyHz))
+        let q = max(0.10, min(18.0, band.q))
+        let gain = max(-24.0, min(24.0, band.gainDB))
+        let A = pow(10.0, gain / 40.0)
+        let w0 = 2.0 * Double.pi * f0 / sampleRate
+        let cosw0 = cos(w0)
+        let sinw0 = sin(w0)
+        let alpha = sinw0 / (2.0 * q)
+
+        var b0 = 1.0
+        var b1 = 0.0
+        var b2 = 0.0
+        var a0 = 1.0
+        var a1 = 0.0
+        var a2 = 0.0
+
+        switch band.filterType {
+        case .peaking:
+            b0 = 1.0 + alpha * A
+            b1 = -2.0 * cosw0
+            b2 = 1.0 - alpha * A
+            a0 = 1.0 + alpha / A
+            a1 = -2.0 * cosw0
+            a2 = 1.0 - alpha / A
+        case .lowShelf:
+            let twoSqrtAAlpha = 2.0 * sqrt(A) * alpha
+            b0 = A * ((A + 1.0) - (A - 1.0) * cosw0 + twoSqrtAAlpha)
+            b1 = 2.0 * A * ((A - 1.0) - (A + 1.0) * cosw0)
+            b2 = A * ((A + 1.0) - (A - 1.0) * cosw0 - twoSqrtAAlpha)
+            a0 = (A + 1.0) + (A - 1.0) * cosw0 + twoSqrtAAlpha
+            a1 = -2.0 * ((A - 1.0) + (A + 1.0) * cosw0)
+            a2 = (A + 1.0) + (A - 1.0) * cosw0 - twoSqrtAAlpha
+        case .highShelf:
+            let twoSqrtAAlpha = 2.0 * sqrt(A) * alpha
+            b0 = A * ((A + 1.0) + (A - 1.0) * cosw0 + twoSqrtAAlpha)
+            b1 = -2.0 * A * ((A - 1.0) + (A + 1.0) * cosw0)
+            b2 = A * ((A + 1.0) + (A - 1.0) * cosw0 - twoSqrtAAlpha)
+            a0 = (A + 1.0) - (A - 1.0) * cosw0 + twoSqrtAAlpha
+            a1 = 2.0 * ((A - 1.0) - (A + 1.0) * cosw0)
+            a2 = (A + 1.0) - (A - 1.0) * cosw0 - twoSqrtAAlpha
+        case .lowPass:
+            b0 = (1.0 - cosw0) * 0.5
+            b1 = 1.0 - cosw0
+            b2 = (1.0 - cosw0) * 0.5
+            a0 = 1.0 + alpha
+            a1 = -2.0 * cosw0
+            a2 = 1.0 - alpha
+        case .highPass:
+            b0 = (1.0 + cosw0) * 0.5
+            b1 = -(1.0 + cosw0)
+            b2 = (1.0 + cosw0) * 0.5
+            a0 = 1.0 + alpha
+            a1 = -2.0 * cosw0
+            a2 = 1.0 - alpha
+        case .notch:
+            b0 = 1.0
+            b1 = -2.0 * cosw0
+            b2 = 1.0
+            a0 = 1.0 + alpha
+            a1 = -2.0 * cosw0
+            a2 = 1.0 - alpha
+        }
+
+        guard abs(a0) > 1e-12 else { return BiquadCoeffs() }
+        return BiquadCoeffs(
+            b0: b0 / a0,
+            b1: b1 / a0,
+            b2: b2 / a0,
+            a1: a1 / a0,
+            a2: a2 / a0
+        )
+    }
+
+    func magnitudeDB(atFrequencyHz freq: Double, sampleRate: Double = PlayerConstants.sampleRate) -> Double {
+        let w = 2.0 * Double.pi * freq / sampleRate
+        let cos1 = cos(w)
+        let sin1 = sin(w)
+        let cos2 = cos(2.0 * w)
+        let sin2 = sin(2.0 * w)
+
+        let numRe = b0 + b1 * cos1 + b2 * cos2
+        let numIm = -b1 * sin1 - b2 * sin2
+        let denRe = 1.0 + a1 * cos1 + a2 * cos2
+        let denIm = -a1 * sin1 - a2 * sin2
+
+        let numSq = numRe * numRe + numIm * numIm
+        let denSq = max(1e-18, denRe * denRe + denIm * denIm)
+        return 10.0 * log10(max(1e-18, numSq / denSq))
+    }
+
+    static func combinedMagnitudeDB(
+        coeffs: [BiquadCoeffs],
+        atFrequencyHz freq: Double,
+        sampleRate: Double = PlayerConstants.sampleRate
+    ) -> Double {
+        var total = 0.0
+        for c in coeffs {
+            total += c.magnitudeDB(atFrequencyHz: freq, sampleRate: sampleRate)
+        }
+        return total
+    }
+}
+
+struct TrackLevelMetrics: Codable, Sendable, Equatable {
+    let peakDBFS: Double
+    let rmsDBFS: Double
+    /// Recommended clean gain boost (`-12.0 ... +12.0 dB`) targeting a `-0.5 dBTP` ceiling.
+    let recommendedAutoGainDB: Double
+}
+
+enum TrackLevelScanner {
+    private final class ScanAccumulator {
+        var maxPeak: Float = 0.0
+        var sumSquares: Double = 0.0
+        var sampleCount: Int64 = 0
+        var maxFramesToScan: Int64 = 48_000 * 600 // cap at 10 minutes for full background scan
+    }
+
+    /// Ultra-fast pre-playback peak probe (~20 ms) used only when playback starts before the background album scan completes.
+    static func quickSampleScan(track: AudioTrack) -> TrackLevelMetrics? {
+        let url = track.url.standardizedFileURL
+        let path = url.path
+        guard path.hasPrefix("/"), FileManager.default.isReadableFile(atPath: path) else { return nil }
+
+        let dur = max(10.0, track.durationSeconds ?? 120.0)
+        let seekPoints = [dur * 0.25, dur * 0.50, dur * 0.72]
+        let acc = ScanAccumulator()
+        let framesPerWindow: Int64 = 48_000 * 3 // 3 seconds per window
+
+        if ac4_native_is_available() != 0 && (track.isAC4 || ac4_native_can_decode_file(path, Int32(max(0, track.audioStreamIndex))) != 0) {
+            var errBuf = [CChar](repeating: 0, count: 256)
+            for (idx, seekSec) in seekPoints.enumerated() {
+                acc.maxFramesToScan = Int64(idx + 1) * framesPerWindow
+                _ = withExtendedLifetime(acc) {
+                    let opaque = Unmanaged.passUnretained(acc).toOpaque()
+                    return ac4_native_stream_file(
+                        path,
+                        Int32(max(0, track.audioStreamIndex)),
+                        seekSec,
+                        48_000,
+                        { samplesPtr, frameCount, userdata in
+                            guard let samplesPtr, let userdata, frameCount > 0 else { return 1 }
+                            let box = Unmanaged<ScanAccumulator>.fromOpaque(userdata).takeUnretainedValue()
+                            let count = Int(frameCount) * 2
+                            var localMax = box.maxPeak
+                            var localSum: Double = 0.0
+                            for i in 0..<count {
+                                let s = samplesPtr[i]
+                                let a = abs(s)
+                                if a > localMax { localMax = a }
+                                localSum += Double(s) * Double(s)
+                            }
+                            box.maxPeak = localMax
+                            box.sumSquares += localSum
+                            box.sampleCount += Int64(count)
+                            return (box.sampleCount / 2) < box.maxFramesToScan ? 1 : 0
+                        },
+                        opaque,
+                        &errBuf,
+                        errBuf.count
+                    )
+                }
+            }
+        } else {
+            return scan(track: track)
+        }
+
+        guard acc.sampleCount > 0, acc.maxPeak > 0.00001 else { return nil }
+        let peakDB = 20.0 * log10(Double(acc.maxPeak))
+        let meanSq = acc.sumSquares / Double(acc.sampleCount)
+        let rmsDB = 10.0 * log10(max(1e-12, meanSq))
+        let rawBoost = -0.5 - peakDB
+        let clampedBoost = max(-12.0, min(12.0, (rawBoost * 10.0).rounded() / 10.0))
+        return TrackLevelMetrics(
+            peakDBFS: (peakDB * 10.0).rounded() / 10.0,
+            rmsDBFS: (rmsDB * 10.0).rounded() / 10.0,
+            recommendedAutoGainDB: clampedBoost
+        )
+    }
+
+    static func scan(track: AudioTrack) -> TrackLevelMetrics? {
+        let url = track.url.standardizedFileURL
+        let path = url.path
+        guard path.hasPrefix("/"), FileManager.default.isReadableFile(atPath: path) else { return nil }
+
+        let acc = ScanAccumulator()
+
+        if ac4_native_is_available() != 0 && (track.isAC4 || ac4_native_can_decode_file(path, Int32(max(0, track.audioStreamIndex))) != 0) {
+            var errBuf = [CChar](repeating: 0, count: 256)
+            _ = withExtendedLifetime(acc) {
+                let opaque = Unmanaged.passUnretained(acc).toOpaque()
+                return ac4_native_stream_file(
+                    path,
+                    Int32(max(0, track.audioStreamIndex)),
+                    0.0,
+                    48_000,
+                    { samplesPtr, frameCount, userdata in
+                        guard let samplesPtr, let userdata, frameCount > 0 else { return 1 }
+                        let box = Unmanaged<ScanAccumulator>.fromOpaque(userdata).takeUnretainedValue()
+                        let count = Int(frameCount) * 2
+                        var localMax = box.maxPeak
+                        var localSum: Double = 0.0
+                        for i in 0..<count {
+                            let s = samplesPtr[i]
+                            let a = abs(s)
+                            if a > localMax { localMax = a }
+                            localSum += Double(s) * Double(s)
+                        }
+                        box.maxPeak = localMax
+                        box.sumSquares += localSum
+                        box.sampleCount += Int64(count)
+                        return (box.sampleCount / 2) < box.maxFramesToScan ? 1 : 0
+                    },
+                    opaque,
+                    &errBuf,
+                    errBuf.count
+                )
+            }
+        } else if !track.isAC4, let audioFile = try? AVAudioFile(forReading: url), audioFile.length > 0 {
+            let fmt = audioFile.processingFormat
+            if fmt.commonFormat == .pcmFormatFloat32,
+               let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: 8192) {
+                while (acc.sampleCount / 2) < acc.maxFramesToScan {
+                    do {
+                        try audioFile.read(into: buf, frameCount: 8192)
+                        let n = Int(buf.frameLength)
+                        if n == 0 { break }
+                        if fmt.isInterleaved, let mData = buf.audioBufferList.pointee.mBuffers.mData {
+                            let ptr = mData.assumingMemoryBound(to: Float.self)
+                            let total = n * Int(fmt.channelCount)
+                            for i in 0..<total {
+                                let s = ptr[i]
+                                let a = abs(s)
+                                if a > acc.maxPeak { acc.maxPeak = a }
+                                acc.sumSquares += Double(s) * Double(s)
+                            }
+                            acc.sampleCount += Int64(total)
+                        } else if let ch = buf.floatChannelData {
+                            let chCount = Int(fmt.channelCount)
+                            for c in 0..<chCount {
+                                let plane = ch[c]
+                                for i in 0..<n {
+                                    let s = plane[i]
+                                    let a = abs(s)
+                                    if a > acc.maxPeak { acc.maxPeak = a }
+                                    acc.sumSquares += Double(s) * Double(s)
+                                }
+                            }
+                            acc.sampleCount += Int64(n * chCount)
+                        } else {
+                            break
+                        }
+                    } catch {
+                        break
+                    }
+                }
+            }
+        }
+
+        guard acc.sampleCount > 0, acc.maxPeak > 0.00001 else { return nil }
+        let peakDB = 20.0 * log10(Double(acc.maxPeak))
+        let meanSq = acc.sumSquares / Double(acc.sampleCount)
+        let rmsDB = 10.0 * log10(max(1e-12, meanSq))
+        // Target -0.5 dBTP ceiling, clamped to [-12.0, +12.0 dB]
+        let rawBoost = -0.5 - peakDB
+        let clampedBoost = max(-12.0, min(12.0, (rawBoost * 10.0).rounded() / 10.0))
+        return TrackLevelMetrics(
+            peakDBFS: (peakDB * 10.0).rounded() / 10.0,
+            rmsDBFS: (rmsDB * 10.0).rounded() / 10.0,
+            recommendedAutoGainDB: clampedBoost
+        )
     }
 }
 
@@ -2519,8 +3142,16 @@ final class PCMStreamRing: @unchecked Sendable {
         fadeGain: inout Float,
         preampCurrentGain: inout Float,
         preampTargetGain: Float,
+        midCurrentGain: inout Float,
+        midTargetGain: Float,
+        sideCurrentGain: inout Float,
+        sideTargetGain: Float,
+        eqCoeffs: UnsafePointer<BiquadCoeffs>,
+        eqState: UnsafeMutablePointer<Double>,
+        eqBandCount: Int,
         peakL: inout Float,
-        peakR: inout Float
+        peakR: inout Float,
+        correlation: inout Float
     ) {
         pthread_mutex_lock(mutex)
         if cancelled || isPrebuffering || availableFrames == 0 {
@@ -2561,9 +3192,19 @@ final class PCMStreamRing: @unchecked Sendable {
         let fadeStep: Float = 1.0 / Float(PlayerConstants.microFadeFrames)
         var localMaxL: Float = 0
         var localMaxR: Float = 0
+        var sumLR: Double = 0
+        var sumLL: Double = 0
+        var sumRR: Double = 0
+
         var curGain = preampCurrentGain
         let needsGainSmoothing = abs(preampTargetGain - curGain) > 0.0001
         let hasPreamp = needsGainSmoothing || abs(curGain - 1.0) > 0.0001
+
+        var curMid = midCurrentGain
+        var curSide = sideCurrentGain
+        let needsMidSmoothing = abs(midTargetGain - curMid) > 0.0001
+        let needsSideSmoothing = abs(sideTargetGain - curSide) > 0.0001
+        let hasMidSide = needsMidSmoothing || needsSideSmoothing || abs(curMid - 1.0) > 0.0001 || abs(curSide - 1.0) > 0.0001
 
         for i in 0..<toRead {
             if needsGainSmoothing {
@@ -2578,6 +3219,58 @@ final class PCMStreamRing: @unchecked Sendable {
                 sL *= curGain
                 sR *= curGain
             }
+
+            // Phase-locked 64-bit Double-precision Biquad Parametric EQ cascade
+            if eqBandCount > 0 {
+                var xL = Double(sL)
+                var xR = Double(sR)
+                for b in 0..<eqBandCount {
+                    let c = eqCoeffs[b]
+                    let stateBase = b * 4
+                    let z1L = eqState[stateBase]
+                    let z2L = eqState[stateBase + 1]
+                    let yL = c.b0 * xL + z1L
+                    eqState[stateBase] = c.b1 * xL - c.a1 * yL + z2L
+                    eqState[stateBase + 1] = c.b2 * xL - c.a2 * yL
+                    xL = yL
+
+                    let z1R = eqState[stateBase + 2]
+                    let z2R = eqState[stateBase + 3]
+                    let yR = c.b0 * xR + z1R
+                    eqState[stateBase + 2] = c.b1 * xR - c.a1 * yR + z2R
+                    eqState[stateBase + 3] = c.b2 * xR - c.a2 * yR
+                    xR = yR
+                }
+                if !xL.isFinite {
+                    xL = 0
+                    memset(eqState, 0, eqBandCount * 4 * MemoryLayout<Double>.size)
+                }
+                if !xR.isFinite {
+                    xR = 0
+                    memset(eqState, 0, eqBandCount * 4 * MemoryLayout<Double>.size)
+                }
+                sL = Float(xL)
+                sR = Float(xR)
+            }
+
+            // Binaural Mid/Side Soundstage Processor (Center Focus + Binaural Width)
+            if hasMidSide {
+                if needsMidSmoothing {
+                    curMid += (midTargetGain - curMid) * 0.0025
+                } else {
+                    curMid = midTargetGain
+                }
+                if needsSideSmoothing {
+                    curSide += (sideTargetGain - curSide) * 0.0025
+                } else {
+                    curSide = sideTargetGain
+                }
+                let mid = 0.5 * (sL + sR) * curMid
+                let side = 0.5 * (sL - sR) * curSide
+                sL = mid + side
+                sR = mid - side
+            }
+
             if fadeGain < 1.0 {
                 sL *= fadeGain
                 sR *= fadeGain
@@ -2592,10 +3285,25 @@ final class PCMStreamRing: @unchecked Sendable {
             let aR = abs(sR)
             if aL > localMaxL { localMaxL = aL }
             if aR > localMaxR { localMaxR = aR }
+
+            let dL = Double(sL)
+            let dR = Double(sR)
+            sumLR += dL * dR
+            sumLL += dL * dL
+            sumRR += dR * dR
         }
         preampCurrentGain = curGain
+        midCurrentGain = curMid
+        sideCurrentGain = curSide
         peakL = localMaxL
         peakR = localMaxR
+
+        let denom = sqrt(sumLL * sumRR)
+        if denom > 1e-9 {
+            correlation = Float(max(-1.0, min(1.0, sumLR / denom)))
+        } else {
+            correlation = 0.0
+        }
     }
 
     func snapshot() -> (consumedFrames: Int64, bufferedSeconds: Double, isFinished: Bool, error: String?) {
@@ -2618,25 +3326,74 @@ private final class EngineRenderState: @unchecked Sendable {
     private var fadeGain: Float = 0.0
     private var preampTargetGain: Float = 1.0
     private var preampCurrentGain: Float = 1.0
+    private var midTargetGain: Float = 1.0
+    private var midCurrentGain: Float = 1.0
+    private var sideTargetGain: Float = 1.0
+    private var sideCurrentGain: Float = 1.0
+
+    // Pre-allocated zero-ARC EQ buffers for the real-time render callback
+    private let configuredCoeffs: UnsafeMutablePointer<BiquadCoeffs>
+    private let renderCoeffsScratch: UnsafeMutablePointer<BiquadCoeffs>
+    private let biquadStates: UnsafeMutablePointer<Double>
+    private var activeBandCount: Int = 0
+    private var resetEQStatePending: Bool = false
+
     private var meterL: Float = 0.0
     private var meterR: Float = 0.0
+    private var meterCorr: Float = 0.0
 
     init() {
         self.lock = .allocate(capacity: 1)
         self.lock.initialize(to: os_unfair_lock())
+        let maxBands = PlayerConstants.maxEQBands
+        self.configuredCoeffs = .allocate(capacity: maxBands)
+        self.configuredCoeffs.initialize(repeating: BiquadCoeffs(), count: maxBands)
+        self.renderCoeffsScratch = .allocate(capacity: maxBands)
+        self.renderCoeffsScratch.initialize(repeating: BiquadCoeffs(), count: maxBands)
+        self.biquadStates = .allocate(capacity: maxBands * 4)
+        self.biquadStates.initialize(repeating: 0.0, count: maxBands * 4)
     }
 
     deinit {
+        biquadStates.deallocate()
+        renderCoeffsScratch.deallocate()
+        configuredCoeffs.deallocate()
         lock.deallocate()
     }
 
-    func setPreampDB(_ db: Float) {
-        let clamped = max(0.0, min(6.0, db))
-        let linear: Float = abs(clamped) < 0.01 ? 1.0 : powf(10.0, clamped / 20.0)
+    func updateDSP(
+        netPreampDB: Float,
+        centerFocusDB: Float,
+        binauralWidthPercent: Float,
+        eqEnabled: Bool,
+        activeCoeffs: [BiquadCoeffs]
+    ) {
+        let clampedPre = max(-24.0, min(12.0, netPreampDB))
+        let preLin: Float = abs(clampedPre) < 0.01 ? 1.0 : powf(10.0, clampedPre / 20.0)
+
+        let clampedMidDB = max(-6.0, min(6.0, centerFocusDB))
+        let midLin: Float = abs(clampedMidDB) < 0.01 ? 1.0 : powf(10.0, clampedMidDB / 20.0)
+
+        let clampedWidth = max(0.0, min(150.0, binauralWidthPercent))
+        let sideLin: Float = clampedWidth / 100.0
+
+        let count = eqEnabled ? min(PlayerConstants.maxEQBands, activeCoeffs.count) : 0
+
         os_unfair_lock_lock(lock)
-        self.preampTargetGain = linear
+        self.preampTargetGain = preLin
+        self.midTargetGain = midLin
+        self.sideTargetGain = sideLin
         if self.paused || self.activeRing == nil {
-            self.preampCurrentGain = linear
+            self.preampCurrentGain = preLin
+            self.midCurrentGain = midLin
+            self.sideCurrentGain = sideLin
+        }
+        if count != self.activeBandCount {
+            self.resetEQStatePending = true
+        }
+        self.activeBandCount = count
+        for i in 0..<count {
+            self.configuredCoeffs[i] = activeCoeffs[i]
         }
         os_unfair_lock_unlock(lock)
     }
@@ -2647,9 +3404,13 @@ private final class EngineRenderState: @unchecked Sendable {
         self.paused = paused
         self.fadeGain = 0.0
         self.preampCurrentGain = self.preampTargetGain
+        self.midCurrentGain = self.midTargetGain
+        self.sideCurrentGain = self.sideTargetGain
+        self.resetEQStatePending = true
         if ring == nil {
             self.meterL = 0
             self.meterR = 0
+            self.meterCorr = 0
         }
         os_unfair_lock_unlock(lock)
     }
@@ -2660,6 +3421,8 @@ private final class EngineRenderState: @unchecked Sendable {
         if !paused {
             self.fadeGain = 0.0
             self.preampCurrentGain = self.preampTargetGain
+            self.midCurrentGain = self.midTargetGain
+            self.sideCurrentGain = self.sideTargetGain
         } else {
             self.meterL = 0
             self.meterR = 0
@@ -2686,7 +3449,21 @@ private final class EngineRenderState: @unchecked Sendable {
         var localFade = fadeGain
         var localPreampCur = preampCurrentGain
         let localPreampTarget = preampTargetGain
+        var localMidCur = midCurrentGain
+        let localMidTarget = midTargetGain
+        var localSideCur = sideCurrentGain
+        let localSideTarget = sideTargetGain
+        let bandCount = activeBandCount
+        let shouldResetEQ = resetEQStatePending
+        resetEQStatePending = false
+        for i in 0..<bandCount {
+            renderCoeffsScratch[i] = configuredCoeffs[i]
+        }
         os_unfair_lock_unlock(lock)
+
+        if shouldResetEQ {
+            memset(biquadStates, 0, PlayerConstants.maxEQBands * 4 * MemoryLayout<Double>.size)
+        }
 
         guard let ring, !isPaused else {
             memset(outL, 0, frameCount * MemoryLayout<Float>.size)
@@ -2696,6 +3473,7 @@ private final class EngineRenderState: @unchecked Sendable {
 
         var pkL: Float = 0
         var pkR: Float = 0
+        var corr: Float = 0
         ring.pullInto(
             outLeft: outL,
             outRight: outR,
@@ -2703,27 +3481,39 @@ private final class EngineRenderState: @unchecked Sendable {
             fadeGain: &localFade,
             preampCurrentGain: &localPreampCur,
             preampTargetGain: localPreampTarget,
+            midCurrentGain: &localMidCur,
+            midTargetGain: localMidTarget,
+            sideCurrentGain: &localSideCur,
+            sideTargetGain: localSideTarget,
+            eqCoeffs: renderCoeffsScratch,
+            eqState: biquadStates,
+            eqBandCount: bandCount,
             peakL: &pkL,
-            peakR: &pkR
+            peakR: &pkR,
+            correlation: &corr
         )
 
         os_unfair_lock_lock(lock)
         fadeGain = localFade
         preampCurrentGain = localPreampCur
+        midCurrentGain = localMidCur
+        sideCurrentGain = localSideCur
         meterL = max(pkL, meterL * 0.82)
         meterR = max(pkR, meterR * 0.82)
+        meterCorr = meterCorr * 0.80 + corr * 0.20
         os_unfair_lock_unlock(lock)
         return noErr
     }
 
-    func readMeters() -> (Float, Float) {
+    func readMeters() -> (Float, Float, Float) {
         os_unfair_lock_lock(lock)
         let l = meterL
         let r = meterR
+        let c = meterCorr
         meterL *= 0.88
         meterR *= 0.88
         os_unfair_lock_unlock(lock)
-        return (l, r)
+        return (l, r, c)
     }
 }
 
@@ -2739,10 +3529,20 @@ final class AC4AudioEngine {
         set { engine.mainMixerNode.outputVolume = max(0.0, min(1.0, newValue)) }
     }
 
-    var preampDB: Float = 0.0 {
-        didSet {
-            renderState.setPreampDB(preampDB)
-        }
+    func updateDSP(
+        netPreampDB: Float,
+        centerFocusDB: Float,
+        binauralWidthPercent: Float,
+        eqEnabled: Bool,
+        activeCoeffs: [BiquadCoeffs]
+    ) {
+        renderState.updateDSP(
+            netPreampDB: netPreampDB,
+            centerFocusDB: centerFocusDB,
+            binauralWidthPercent: binauralWidthPercent,
+            eqEnabled: eqEnabled,
+            activeCoeffs: activeCoeffs
+        )
     }
 
     init() {
@@ -3487,14 +4287,14 @@ final class AC4AudioEngine {
         }
     }
 
-    func pollProgress() -> (positionSeconds: Double, bufferedSeconds: Double, isFinished: Bool, error: String?, meterL: Float, meterR: Float) {
-        let (mL, mR) = renderState.readMeters()
+    func pollProgress() -> (positionSeconds: Double, bufferedSeconds: Double, isFinished: Bool, error: String?, meterL: Float, meterR: Float, meterCorr: Float) {
+        let (mL, mR, mCorr) = renderState.readMeters()
         guard let ring = activeRing else {
-            return (0, 0, false, nil, 0, 0)
+            return (0, 0, false, nil, 0, 0, 0)
         }
         let snap = ring.snapshot()
         let pos = ring.startTimeSeconds + (Double(snap.consumedFrames) / PlayerConstants.sampleRate)
-        return (pos, snap.bufferedSeconds, snap.isFinished, snap.error, mL, mR)
+        return (pos, snap.bufferedSeconds, snap.isFinished, snap.error, mL, mR, mCorr)
     }
 }
 
@@ -3519,31 +4319,32 @@ enum DecoderResolver {
     }
 
     static func resolveStatus(customPath: String?) -> DecoderStatus {
-        // 1. User-selected custom binary path (falls back to Built-in if stale/blocked)
-        if let custom = customPath?.trimmingCharacters(in: .whitespacesAndNewlines), !custom.isEmpty {
-            let url = URL(fileURLWithPath: custom).standardizedFileURL
-            if FileManager.default.isExecutableFile(atPath: url.path) {
-                let verified = verifyBinary(url: url, sourceLabel: "Custom")
-                if verified.isAC4Capable || builtInStatus() == nil {
-                    return verified
-                }
-            } else if builtInStatus() == nil {
-                return .notFound(reason: "Configured binary not found at \(custom)")
-            }
-        }
-
-        // 2. Built-in statically linked LibreMPEG (`libavcodec` + `libavformat` in-process)
+        // 1. Built-in statically linked LibreMPEG (`libavcodec` + `libavformat` in-process) always wins
+        // so moving AC4 Player.app to /Applications is 100% self-contained with zero external binary dependencies.
         if let native = builtInStatus() {
             return native
         }
 
-        // 3. Personal Bundled binary inside AC4 Player.app/Contents/Resources/bin/
+        // 2. Personal Bundled binary inside AC4 Player.app/Contents/Resources/bin/
         if let resURL = Bundle.main.resourceURL {
             for name in ["librempeg", "ffmpeg"] {
                 let bundled = resURL.appendingPathComponent("bin/\(name)").standardizedFileURL
                 if FileManager.default.isExecutableFile(atPath: bundled.path) {
-                    return verifyBinary(url: bundled, sourceLabel: "Bundled")
+                    let status = verifyBinary(url: bundled, sourceLabel: "Bundled")
+                    if status.isAC4Capable {
+                        return status
+                    }
                 }
+            }
+        }
+
+        // 3. User-selected custom binary path
+        if let custom = customPath?.trimmingCharacters(in: .whitespacesAndNewlines), !custom.isEmpty {
+            let url = URL(fileURLWithPath: custom).standardizedFileURL
+            if FileManager.default.isExecutableFile(atPath: url.path) {
+                return verifyBinary(url: url, sourceLabel: "Custom")
+            } else {
+                return .notFound(reason: "Configured binary not found at \(custom)")
             }
         }
 
@@ -3738,18 +4539,114 @@ final class PlayerViewModel: ObservableObject {
     }
     @Published var preampDB: Double = 0.0 {
         didSet {
-            let clamped = max(0.0, min(6.0, preampDB))
+            let clamped = max(-12.0, min(12.0, (preampDB * 10.0).rounded() / 10.0))
             if abs(clamped - preampDB) > 0.001 {
                 preampDB = clamped
                 return
             }
-            audioEngine.preampDB = Float(clamped)
             UserDefaults.standard.set(clamped, forKey: PlayerConstants.preampDefaultsKey)
+            syncDSPToEngine()
         }
     }
 
+    // MARK: - Binaural Soundstage, Auto-Gain & Phase-Locked Parametric EQ State
+
+    @Published var showDSPPanel: Bool = false {
+        didSet {
+            UserDefaults.standard.set(showDSPPanel, forKey: PlayerConstants.showDSPPanelDefaultsKey)
+            if showDSPPanel {
+                scanLibraryAlbumsInBackground()
+            }
+        }
+    }
+
+    @Published var autoGainEnabled: Bool = false {
+        didSet {
+            UserDefaults.standard.set(autoGainEnabled, forKey: PlayerConstants.autoGainDefaultsKey)
+            if autoGainEnabled {
+                if let current = currentTrack {
+                    lockAlbumPeakBeforePlayback(for: current)
+                }
+                scanLibraryAlbumsInBackground()
+            }
+            syncDSPToEngine()
+        }
+    }
+
+    @Published var binauralWidthPercent: Double = 100.0 {
+        didSet {
+            let clamped = max(50.0, min(150.0, binauralWidthPercent.rounded()))
+            if abs(clamped - binauralWidthPercent) > 0.001 {
+                binauralWidthPercent = clamped
+                return
+            }
+            UserDefaults.standard.set(clamped, forKey: PlayerConstants.binauralWidthDefaultsKey)
+            syncDSPToEngine()
+        }
+    }
+
+    @Published var centerFocusDB: Double = 0.0 {
+        didSet {
+            let clamped = max(-6.0, min(6.0, (centerFocusDB * 10.0).rounded() / 10.0))
+            if abs(clamped - centerFocusDB) > 0.001 {
+                centerFocusDB = clamped
+                return
+            }
+            UserDefaults.standard.set(clamped, forKey: PlayerConstants.centerFocusDefaultsKey)
+            syncDSPToEngine()
+        }
+    }
+
+    @Published var eqEnabled: Bool = false {
+        didSet {
+            UserDefaults.standard.set(eqEnabled, forKey: PlayerConstants.eqEnabledDefaultsKey)
+            syncDSPToEngine()
+        }
+    }
+
+    @Published var eqPreampDB: Double = 0.0 {
+        didSet {
+            let clamped = max(-12.0, min(12.0, (eqPreampDB * 10.0).rounded() / 10.0))
+            if abs(clamped - eqPreampDB) > 0.001 {
+                eqPreampDB = clamped
+                return
+            }
+            UserDefaults.standard.set(clamped, forKey: PlayerConstants.eqPreampDefaultsKey)
+            if !isApplyingEQPreset {
+                selectedEQProfileID = nil
+                UserDefaults.standard.removeObject(forKey: PlayerConstants.selectedEQProfileIDDefaultsKey)
+            }
+            syncDSPToEngine()
+        }
+    }
+
+    @Published var eqBands: [EQBand] = EQProfile.builtInPresets[0].bands {
+        didSet {
+            persistEQBands()
+            if !isApplyingEQPreset {
+                selectedEQProfileID = nil
+                UserDefaults.standard.removeObject(forKey: PlayerConstants.selectedEQProfileIDDefaultsKey)
+            }
+            syncDSPToEngine()
+        }
+    }
+
+    @Published var savedEQProfiles: [EQProfile] = [] {
+        didSet {
+            persistSavedEQProfiles()
+        }
+    }
+
+    @Published var selectedEQProfileID: UUID? = EQProfile.builtInPresets[0].id
+    @Published private(set) var eqStatusMessage: String?
+
     @Published private(set) var meterLeft: Float = 0.0
     @Published private(set) var meterRight: Float = 0.0
+    @Published private(set) var meterCorrelation: Float = 0.0
+    @Published private(set) var trackLevelCache: [String: TrackLevelMetrics] = [:]
+    @Published private(set) var lockedAlbumPeakByKey: [String: Double] = [:]
+    @Published private(set) var isScanningTrackLevel: Bool = false
+
     @Published private(set) var decoderStatus: DecoderStatus = .notFound(reason: "Checking decoder…")
     @Published var customDecoderPath: String?
     @Published var errorBanner: String?
@@ -3765,22 +4662,58 @@ final class PlayerViewModel: ObservableObject {
     private var remoteCommandsConfigured = false
     private var activeExportToken: ExportCancellationToken?
     private var activeExportTask: Task<Void, Never>?
+    private var activeLevelScanTask: Task<Void, Never>?
+    private var isApplyingEQPreset = false
 
     init() {
-        let savedVol = UserDefaults.standard.object(forKey: PlayerConstants.volumeDefaultsKey) as? Double
+        let defaults = UserDefaults.standard
+
+        let savedVol = defaults.object(forKey: PlayerConstants.volumeDefaultsKey) as? Double
         let initialVol = savedVol ?? 0.85
         self.volume = initialVol
         audioEngine.volume = Float(initialVol)
 
-        let savedPreamp = UserDefaults.standard.object(forKey: PlayerConstants.preampDefaultsKey) as? Double
-        let initialPreamp = max(0.0, min(6.0, savedPreamp ?? 0.0))
-        self.preampDB = initialPreamp
-        audioEngine.preampDB = Float(initialPreamp)
+        let savedPreamp = defaults.object(forKey: PlayerConstants.preampDefaultsKey) as? Double
+        self.preampDB = max(-12.0, min(12.0, savedPreamp ?? 0.0))
 
-        let savedCustom = UserDefaults.standard.string(forKey: PlayerConstants.customDecoderDefaultsKey)
+        if let cacheData = defaults.data(forKey: PlayerConstants.trackLevelCacheDefaultsKey),
+           let decodedCache = try? JSONDecoder().decode([String: TrackLevelMetrics].self, from: cacheData) {
+            self.trackLevelCache = decodedCache
+        }
+
+        self.showDSPPanel = defaults.bool(forKey: PlayerConstants.showDSPPanelDefaultsKey)
+        self.autoGainEnabled = defaults.bool(forKey: PlayerConstants.autoGainDefaultsKey)
+
+        if let savedWidth = defaults.object(forKey: PlayerConstants.binauralWidthDefaultsKey) as? Double {
+            self.binauralWidthPercent = max(50.0, min(150.0, savedWidth))
+        }
+        if let savedCenter = defaults.object(forKey: PlayerConstants.centerFocusDefaultsKey) as? Double {
+            self.centerFocusDB = max(-6.0, min(6.0, savedCenter))
+        }
+        self.eqEnabled = defaults.bool(forKey: PlayerConstants.eqEnabledDefaultsKey)
+        if let savedEQPre = defaults.object(forKey: PlayerConstants.eqPreampDefaultsKey) as? Double {
+            self.eqPreampDB = max(-12.0, min(12.0, savedEQPre))
+        }
+        if let profilesData = defaults.data(forKey: PlayerConstants.savedEQProfilesDefaultsKey),
+           let decodedProfiles = try? JSONDecoder().decode([EQProfile].self, from: profilesData) {
+            self.savedEQProfiles = decodedProfiles
+        }
+        if let bandsData = defaults.data(forKey: PlayerConstants.eqBandsDefaultsKey),
+           let decodedBands = try? JSONDecoder().decode([EQBand].self, from: bandsData),
+           !decodedBands.isEmpty {
+            self.isApplyingEQPreset = true
+            self.eqBands = Array(decodedBands.prefix(PlayerConstants.maxEQBands))
+            self.isApplyingEQPreset = false
+        }
+        if let idStr = defaults.string(forKey: PlayerConstants.selectedEQProfileIDDefaultsKey),
+           let uuid = UUID(uuidString: idStr) {
+            self.selectedEQProfileID = uuid
+        }
+
+        let savedCustom = defaults.string(forKey: PlayerConstants.customDecoderDefaultsKey)
         self.customDecoderPath = savedCustom
 
-        if savedCustom == nil && ac4_native_is_available() != 0 {
+        if ac4_native_is_available() != 0 {
             let ver = String(cString: ac4_native_version_string())
             var caps = DecoderCapabilities()
             caps.isBuiltInNative = true
@@ -3790,8 +4723,13 @@ final class PlayerViewModel: ObservableObject {
                 versionLine: ver,
                 capabilities: caps
             )
+            if savedCustom != nil {
+                self.customDecoderPath = nil
+                defaults.removeObject(forKey: PlayerConstants.customDecoderDefaultsKey)
+            }
         }
 
+        syncDSPToEngine()
         setupRemoteCommands()
         startProgressTimer()
 
@@ -3801,11 +4739,345 @@ final class PlayerViewModel: ObservableObject {
         }
     }
 
+    var currentTrackLevels: TrackLevelMetrics? {
+        guard let track = currentTrack else { return nil }
+        return trackLevelCache[track.url.standardizedFileURL.path]
+    }
+
+    /// Album-level true peak (`dBFS`) for a given track's album.
+    /// Once locked for an active album playback session, it never changes mid-track or between album tracks.
+    func albumPeakDBFS(for track: AudioTrack) -> Double? {
+        let aKey = track.albumKey
+        if let locked = lockedAlbumPeakByKey[aKey] {
+            return locked
+        }
+        let albumTracks = tracks.filter { $0.albumKey == aKey }
+        let peaks = albumTracks.compactMap { trackLevelCache[$0.url.standardizedFileURL.path]?.peakDBFS }
+        if let maxPeak = peaks.max() {
+            return maxPeak
+        }
+        return trackLevelCache[track.url.standardizedFileURL.path]?.peakDBFS
+    }
+
+    var currentAlbumPeakDBFS: Double? {
+        guard let refTrack = currentTrack ?? selectedOrCurrentTrack ?? tracks.first else { return nil }
+        return albumPeakDBFS(for: refTrack)
+    }
+
+    /// Headroom delta (`dB`) from active Parametric EQ filters:
+    /// Compensates for negative filter cuts (e.g. `-11 dB` subtractive filters) while subtracting positive filter peaks.
+    var eqHeadroomDeltaDB: Double {
+        guard eqEnabled else { return 0.0 }
+        let coeffs = activeBiquadCoeffs
+        guard !coeffs.isEmpty else { return 0.0 }
+
+        var minCurveDB = 0.0
+        var maxCurveDB = 0.0
+        let steps = 64
+        for i in 0...steps {
+            let t = Double(i) / Double(steps)
+            let freq = 20.0 * pow(1000.0, t)
+            let db = BiquadCoeffs.combinedMagnitudeDB(coeffs: coeffs, atFrequencyHz: freq)
+            if db < minCurveDB { minCurveDB = db }
+            if db > maxCurveDB { maxCurveDB = db }
+        }
+
+        let minBandDB = eqBands
+            .filter { $0.isEnabled && $0.filterType.usesGain }
+            .map(\.gainDB)
+            .min() ?? 0.0
+        let deepestNegativeDB = min(0.0, min(minCurveDB, minBandDB))
+        let delta = -deepestNegativeDB - max(0.0, maxCurveDB)
+        return (delta * 10.0).rounded() / 10.0
+    }
+
+    /// Recommended Album-Level Auto-Gain (`-12.0 dB ... +12.0 dB`) combining album true-peak headroom and Parametric EQ filter gain.
+    var computedAutoGainDB: Double {
+        let albumHeadroomDB = currentAlbumPeakDBFS.map { -0.5 - $0 } ?? 0.0
+        let raw = albumHeadroomDB + eqHeadroomDeltaDB
+        return max(-12.0, min(12.0, (raw * 10.0).rounded() / 10.0))
+    }
+
+    var effectiveBasePreampDB: Double {
+        autoGainEnabled ? computedAutoGainDB : preampDB
+    }
+
+    var effectiveNetPreampDB: Double {
+        effectiveBasePreampDB
+    }
+
+    var allEQProfiles: [EQProfile] {
+        EQProfile.builtInPresets + savedEQProfiles
+    }
+
+    var activeEQProfileName: String {
+        if let id = selectedEQProfileID,
+           let match = allEQProfiles.first(where: { $0.id == id }) {
+            return match.name
+        }
+        return "Custom"
+    }
+
+    var activeBiquadCoeffs: [BiquadCoeffs] {
+        eqBands.filter(\.isEnabled).map { BiquadCoeffs.make(band: $0) }
+    }
+
+    var hasActiveBinauralDSP: Bool {
+        eqEnabled
+            || autoGainEnabled
+            || abs(preampDB) > 0.05
+            || abs(binauralWidthPercent - 100.0) > 0.5
+            || abs(centerFocusDB) > 0.05
+    }
+
+    func syncDSPToEngine() {
+        let coeffs = eqEnabled ? activeBiquadCoeffs : []
+        audioEngine.updateDSP(
+            netPreampDB: Float(effectiveNetPreampDB),
+            centerFocusDB: Float(centerFocusDB),
+            binauralWidthPercent: Float(binauralWidthPercent),
+            eqEnabled: eqEnabled && !coeffs.isEmpty,
+            activeCoeffs: coeffs
+        )
+    }
+
+    func setManualPreampFromSlider(_ newDB: Double) {
+        if autoGainEnabled {
+            autoGainEnabled = false
+        }
+        preampDB = (newDB * 2.0).rounded() / 2.0
+    }
+
     func togglePreampBoost() {
-        if preampDB > 0.05 {
+        if autoGainEnabled {
+            autoGainEnabled = false
+        }
+        if abs(preampDB) > 0.05 {
             preampDB = 0.0
         } else {
             preampDB = 6.0
+        }
+    }
+
+    func resetBinauralStage() {
+        binauralWidthPercent = 100.0
+        centerFocusDB = 0.0
+        if autoGainEnabled {
+            autoGainEnabled = false
+        }
+        preampDB = 0.0
+    }
+
+    func selectEQProfile(_ profile: EQProfile) {
+        isApplyingEQPreset = true
+        selectedEQProfileID = profile.id
+        eqPreampDB = max(-12.0, min(12.0, profile.preampDB))
+        if !autoGainEnabled {
+            preampDB = max(-12.0, min(12.0, profile.preampDB))
+        }
+        eqBands = Array(profile.bands.prefix(PlayerConstants.maxEQBands))
+        eqEnabled = true
+        isApplyingEQPreset = false
+        UserDefaults.standard.set(profile.id.uuidString, forKey: PlayerConstants.selectedEQProfileIDDefaultsKey)
+        eqStatusMessage = "Loaded preset '\(profile.name)' (\(eqBands.count) bands)"
+        syncDSPToEngine()
+    }
+
+    func resetEQFlat() {
+        selectEQProfile(EQProfile.builtInPresets[0])
+    }
+
+    func addEQBand() {
+        guard eqBands.count < PlayerConstants.maxEQBands else { return }
+        let suggestedFreqs: [Double] = [60, 125, 250, 500, 1000, 2000, 4000, 8000, 12000, 16000]
+        let existing = Set(eqBands.map { Int($0.frequencyHz.rounded()) })
+        let defaultFreq = suggestedFreqs.first { !existing.contains(Int($0)) } ?? 1000.0
+        eqBands.append(
+            EQBand(
+                isEnabled: true,
+                filterType: .peaking,
+                frequencyHz: defaultFreq,
+                gainDB: 0.0,
+                q: 1.0
+            )
+        )
+        if !eqEnabled {
+            eqEnabled = true
+        }
+    }
+
+    func removeEQBand(id: UUID) {
+        eqBands.removeAll { $0.id == id }
+    }
+
+    func deleteSavedEQProfile(_ profile: EQProfile) {
+        guard !profile.isBuiltIn else { return }
+        savedEQProfiles.removeAll { $0.id == profile.id }
+        if selectedEQProfileID == profile.id {
+            selectedEQProfileID = nil
+            UserDefaults.standard.removeObject(forKey: PlayerConstants.selectedEQProfileIDDefaultsKey)
+        }
+    }
+
+    func pickAndLoadEQProfileTxt() {
+        let panel = NSOpenPanel()
+        panel.title = "Load Parametric EQ Profile (.txt)"
+        panel.message = "Select an AutoEQ, EqualizerAPO, squig.link, or Oratory1990 .txt parametric EQ file."
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        panel.allowedContentTypes = [.plainText]
+        panel.allowsOtherFileTypes = true
+
+        if panel.runModal() == .OK {
+            for url in panel.urls {
+                importEQProfile(from: url)
+            }
+        }
+    }
+
+    func importEQProfile(from url: URL) {
+        let std = url.standardizedFileURL
+        guard let data = try? Data(contentsOf: std),
+              let rawText = String(data: data, encoding: .utf8)
+                ?? String(data: data, encoding: .isoLatin1) else {
+            errorBanner = "Could not read EQ profile file '\(std.lastPathComponent)'."
+            return
+        }
+
+        let baseName = std.deletingPathExtension().lastPathComponent
+        guard var parsed = AutoEQParser.parse(text: rawText, defaultName: baseName) else {
+            errorBanner = "No AutoEQ / EqualizerAPO filters found in '\(std.lastPathComponent)'. Expected lines like: Filter 1: ON PK Fc 1000 Hz Gain -2.0 dB Q 1.41"
+            return
+        }
+
+        if let existingIdx = savedEQProfiles.firstIndex(where: { $0.name.caseInsensitiveCompare(parsed.name) == .orderedSame }) {
+            parsed.id = savedEQProfiles[existingIdx].id
+            savedEQProfiles[existingIdx] = parsed
+        } else {
+            savedEQProfiles.append(parsed)
+        }
+
+        errorBanner = nil
+        showDSPPanel = true
+        selectEQProfile(parsed)
+    }
+
+    func exportCurrentEQProfileTxt() {
+        let panel = NSSavePanel()
+        panel.title = "Export Parametric EQ Profile (.txt)"
+        panel.message = "Save the current Parametric EQ curve in AutoEQ / EqualizerAPO .txt format."
+        let base = activeEQProfileName == "Custom" ? "Custom Binaural EQ" : activeEQProfileName
+        panel.nameFieldStringValue = "\(base).txt"
+        panel.allowedContentTypes = [.plainText]
+        panel.canCreateDirectories = true
+
+        if panel.runModal() == .OK, let outURL = panel.url {
+            let content = AutoEQParser.serialize(preampDB: effectiveNetPreampDB, bands: eqBands)
+            do {
+                try content.write(to: outURL, atomically: true, encoding: .utf8)
+                eqStatusMessage = "Exported '\(outURL.lastPathComponent)'"
+            } catch {
+                errorBanner = "Could not save EQ profile: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func persistEQBands() {
+        if let data = try? JSONEncoder().encode(eqBands) {
+            UserDefaults.standard.set(data, forKey: PlayerConstants.eqBandsDefaultsKey)
+        }
+    }
+
+    private func persistSavedEQProfiles() {
+        if let data = try? JSONEncoder().encode(savedEQProfiles) {
+            UserDefaults.standard.set(data, forKey: PlayerConstants.savedEQProfilesDefaultsKey)
+        }
+    }
+
+    private func persistTrackLevelCache() {
+        if let data = try? JSONEncoder().encode(trackLevelCache) {
+            UserDefaults.standard.set(data, forKey: PlayerConstants.trackLevelCacheDefaultsKey)
+        }
+    }
+
+    /// Locks the album's peak *before* playback starts so Auto-Gain never recomputes or changes volume after a track starts.
+    func lockAlbumPeakBeforePlayback(for track: AudioTrack) {
+        let aKey = track.albumKey
+        if lockedAlbumPeakByKey[aKey] != nil {
+            return
+        }
+        let albumTracks = tracks.filter { $0.albumKey == aKey }
+        let cachedPeaks = albumTracks.compactMap { trackLevelCache[$0.url.standardizedFileURL.path]?.peakDBFS }
+        if let maxAlbumPeak = cachedPeaks.max() {
+            lockedAlbumPeakByKey[aKey] = maxAlbumPeak
+            return
+        }
+
+        // If this is a brand-new uncached album and playback started immediately, run a fast synchronous ~20 ms probe
+        // right before starting the audio stream so the gain is locked before sample 0 plays.
+        if let quick = TrackLevelScanner.quickSampleScan(track: track) {
+            let path = track.url.standardizedFileURL.path
+            trackLevelCache[path] = quick
+            lockedAlbumPeakByKey[aKey] = quick.peakDBFS
+            persistTrackLevelCache()
+        }
+    }
+
+    /// Pre-scans all unscanned album tracks in the background when files are added to the library.
+    /// Never alters the locked album peak of a currently playing album mid-song.
+    func scanLibraryAlbumsInBackground() {
+        let existingKeys = Set(trackLevelCache.keys)
+        let pendingTracks = tracks.filter { !existingKeys.contains($0.url.standardizedFileURL.path) }
+        guard !pendingTracks.isEmpty else {
+            refreshUnlockedAlbumPeaks()
+            return
+        }
+        guard activeLevelScanTask == nil else { return }
+
+        isScanningTrackLevel = true
+
+        let recordOnMain: @MainActor @Sendable (String, TrackLevelMetrics) -> Void = { [weak self] path, metrics in
+            guard let self else { return }
+            self.trackLevelCache[path] = metrics
+            self.persistTrackLevelCache()
+            self.refreshUnlockedAlbumPeaks()
+        }
+
+        let finishAllOnMain: @MainActor @Sendable () -> Void = { [weak self] in
+            guard let self else { return }
+            self.isScanningTrackLevel = false
+            self.activeLevelScanTask = nil
+            self.refreshUnlockedAlbumPeaks()
+        }
+
+        activeLevelScanTask = Task.detached(priority: .utility) {
+            for item in pendingTracks {
+                if Task.isCancelled { break }
+                let path = item.url.standardizedFileURL.path
+                if let measured = TrackLevelScanner.scan(track: item) {
+                    await recordOnMain(path, measured)
+                }
+            }
+            await finishAllOnMain()
+        }
+    }
+
+    private func refreshUnlockedAlbumPeaks() {
+        let playingAlbumKey = isPlaying ? currentTrack?.albumKey : nil
+        let grouped = Dictionary(grouping: tracks, by: \.albumKey)
+        for (aKey, albumTracks) in grouped {
+            // Never change the locked peak of an album that is currently playing
+            if aKey == playingAlbumKey && lockedAlbumPeakByKey[aKey] != nil {
+                continue
+            }
+            let peaks = albumTracks.compactMap { trackLevelCache[$0.url.standardizedFileURL.path]?.peakDBFS }
+            if let maxPeak = peaks.max() {
+                lockedAlbumPeakByKey[aKey] = maxPeak
+            }
+        }
+        if !isPlaying {
+            syncDSPToEngine()
         }
     }
 
@@ -3959,6 +5231,7 @@ final class PlayerViewModel: ObservableObject {
             if wasEmpty, let first = self.tracks.first {
                 self.selectedTrackID = first.id
             }
+            self.scanLibraryAlbumsInBackground()
         }
     }
 
@@ -3996,6 +5269,7 @@ final class PlayerViewModel: ObservableObject {
                 }
             }
         }
+        refreshUnlockedAlbumPeaks()
     }
 
     func removeTrack(_ track: AudioTrack) {
@@ -4205,6 +5479,9 @@ final class PlayerViewModel: ObservableObject {
                 }
             }
         }
+        // Lock the album's true peak BEFORE starting the stream so Auto-Gain never changes mid-track or between tracks on the album
+        lockAlbumPeakBeforePlayback(for: track)
+        syncDSPToEngine()
 
         do {
             try audioEngine.startStream(
@@ -4217,6 +5494,7 @@ final class PlayerViewModel: ObservableObject {
             )
             isPlaying = true
             updateNowPlayingCenter()
+            scanLibraryAlbumsInBackground()
         } catch {
             isPlaying = false
             errorBanner = "Playback failed: \(error.localizedDescription)"
@@ -4255,6 +5533,7 @@ final class PlayerViewModel: ObservableObject {
         bufferedAheadSeconds = 0
         meterLeft = 0
         meterRight = 0
+        meterCorrelation = 0
         currentTrack = nil
         currentArtwork = nil
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
@@ -4351,6 +5630,7 @@ final class PlayerViewModel: ObservableObject {
         let snap = audioEngine.pollProgress()
         meterLeft = snap.meterL
         meterRight = snap.meterR
+        meterCorrelation = snap.meterCorr
         bufferedAheadSeconds = snap.bufferedSeconds
 
         if let err = snap.error {
@@ -4501,11 +5781,16 @@ struct ContentView: View {
         VStack(spacing: 0) {
             MainLibraryView(vm: vm)
 
+            if vm.showDSPPanel {
+                Divider()
+                BinauralDSPPanelView(vm: vm)
+            }
+
             Divider()
 
             TransportBarView(vm: vm)
         }
-        .frame(minWidth: 840, minHeight: 520)
+        .frame(minWidth: 900, minHeight: 560)
         .onDrop(of: [.fileURL], isTargeted: $vm.isDropTargeted) { providers in
             handleFileDrop(providers)
         }
@@ -4534,7 +5819,12 @@ struct ContentView: View {
                 }
                 if let url = resolvedURL {
                     Task { @MainActor in
-                        vm.addURLs([url])
+                        let ext = url.pathExtension.lowercased()
+                        if PlayerConstants.eqProfileExtensions.contains(ext) {
+                            vm.importEQProfile(from: url)
+                        } else {
+                            vm.addURLs([url])
+                        }
                     }
                 }
             }
@@ -4619,6 +5909,13 @@ struct MainLibraryView: View {
         }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
+                Button {
+                    vm.showDSPPanel.toggle()
+                } label: {
+                    Label("Binaural & EQ Studio", systemImage: "slider.horizontal.3")
+                }
+                .help("Toggle Binaural Soundstage, Auto-Gain & Parametric EQ Studio (⌘D)")
+
                 if !vm.decoderStatus.isAC4Capable {
                     Button {
                         vm.pickDecoderBinary()
@@ -4654,18 +5951,18 @@ struct EmptyLibraryDropView: View {
     var body: some View {
         VStack(spacing: 14) {
             Spacer()
-            Image(systemName: "waveform.badge.magnifyingglass")
-                .font(.system(size: 48, weight: .light))
+            Image(systemName: "headphones.circle")
+                .font(.system(size: 50, weight: .light))
                 .foregroundStyle(.secondary)
 
-            Text("Drop AC-4 IMS Files or Music Folders Here")
+            Text("Drop AC-4 IMS Files, Music Folders, or .txt EQ Profiles Here")
                 .font(.title3.weight(.semibold))
 
-            Text("Plays .m4a, .mp4, and .ac4 audio in 48 kHz 32-bit float via LibreMPEG.")
+            Text("Binaural audio player with built-in 48 kHz 32-bit float LibreMPEG AC-4 decoding, phase-locked Parametric EQ, Auto-Gain, and Mid/Side stage control.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
-                .frame(maxWidth: 460)
+                .frame(maxWidth: 520)
 
             HStack(spacing: 10) {
                 Button("Add Files or Folders…") {
@@ -4775,7 +6072,7 @@ struct TrackRowView: View {
             ZStack {
                 if isCurrent {
                     Image(systemName: isPlaying ? "speaker.wave.2.fill" : "pause.fill")
-                        .foregroundStyle(Color.accentColor)
+                        .foregroundStyle(Color.green)
                         .font(.caption.weight(.bold))
                 } else {
                     Text(track.formattedTrackNumber)
@@ -4788,7 +6085,7 @@ struct TrackRowView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(track.title)
                     .font(.body.weight(isCurrent ? .semibold : .regular))
-                    .foregroundStyle(isCurrent ? Color.accentColor : Color.primary)
+                    .foregroundStyle(Color.primary)
                     .lineLimit(1)
                 Text("\(track.effectiveArtist) — \(track.effectiveAlbumTitle)")
                     .font(.caption)
@@ -4829,6 +6126,568 @@ struct CodecBadgeView: View {
                     .fill(isAC4 ? Color.purple.opacity(0.20) : Color.secondary.opacity(0.14))
             )
             .foregroundStyle(isAC4 ? Color.purple : Color.secondary)
+    }
+}
+
+// MARK: - Binaural Soundstage, Auto-Gain & Phase-Locked Parametric EQ Drawer
+
+struct BinauralDSPPanelView: View {
+    @ObservedObject var vm: PlayerViewModel
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 18) {
+            // Left Column: Binaural Soundstage (Mid/Side), Pre-Amp (-12..+12 dB), Auto-Gain & Phase Correlation
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Label("Binaural Stage & Headroom", systemImage: "headphones")
+                        .font(.subheadline.weight(.semibold))
+                    Spacer()
+                    let stageModified = abs(vm.binauralWidthPercent - 100.0) > 0.5
+                        || abs(vm.centerFocusDB) > 0.05
+                        || abs(vm.preampDB) > 0.05
+                        || vm.autoGainEnabled
+                    if stageModified {
+                        Button("Reset") {
+                            vm.resetBinauralStage()
+                        }
+                        .buttonStyle(.borderless)
+                        .font(.caption)
+                    }
+                }
+
+                // 1. Binaural Width (Side Gain 50%...150%)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack {
+                        Text("Binaural Width (Side)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button {
+                            vm.binauralWidthPercent = 100.0
+                        } label: {
+                            Text("\(Int(vm.binauralWidthPercent.rounded()))%")
+                                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 1)
+                                .background(
+                                    Capsule()
+                                        .fill(abs(vm.binauralWidthPercent - 100.0) > 0.5 ? Color.accentColor.opacity(0.18) : Color.secondary.opacity(0.12))
+                                )
+                                .foregroundStyle(abs(vm.binauralWidthPercent - 100.0) > 0.5 ? Color.accentColor : Color.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Click to reset Binaural Width to 100%")
+                    }
+                    Slider(value: $vm.binauralWidthPercent, in: 50.0...150.0, step: 1.0)
+                        .controlSize(.small)
+                        .help("Scales the binaural Side (L−R) spatial field without altering ITD phase timing (100% = untouched)")
+                }
+
+                // 2. Center Focus (Mid Gain -6 dB...+6 dB)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack {
+                        Text("Center Focus (Mid)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button {
+                            vm.centerFocusDB = 0.0
+                        } label: {
+                            Text(String(format: "%+.1f dB", vm.centerFocusDB))
+                                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 1)
+                                .background(
+                                    Capsule()
+                                        .fill(abs(vm.centerFocusDB) > 0.05 ? Color.accentColor.opacity(0.18) : Color.secondary.opacity(0.12))
+                                )
+                                .foregroundStyle(abs(vm.centerFocusDB) > 0.05 ? Color.accentColor : Color.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Click to reset Center Focus to 0.0 dB")
+                    }
+                    Slider(value: $vm.centerFocusDB, in: -6.0...6.0, step: 0.5)
+                        .controlSize(.small)
+                        .help("Adjusts phantom center (L+R) presence (+dB brings vocals forward; −dB deepens hall ambience)")
+                }
+
+                // 3. Pre-Amp (-12.0 dB ... +12.0 dB) right under Center Focus
+                VStack(alignment: .leading, spacing: 2) {
+                    let netPre = vm.effectiveNetPreampDB
+                    let isPreActive = abs(netPre) > 0.05 || vm.autoGainEnabled
+                    HStack {
+                        Text(vm.autoGainEnabled ? "Pre-Amp (Auto)" : "Pre-Amp")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button {
+                            if vm.autoGainEnabled {
+                                vm.autoGainEnabled = false
+                            }
+                            vm.preampDB = 0.0
+                        } label: {
+                            Text(String(format: "%+.1f dB", netPre))
+                                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 1)
+                                .background(
+                                    Capsule()
+                                        .fill(
+                                            vm.autoGainEnabled
+                                                ? Color.green.opacity(0.20)
+                                                : (isPreActive ? Color.accentColor.opacity(0.18) : Color.secondary.opacity(0.12))
+                                        )
+                                )
+                                .foregroundStyle(
+                                    vm.autoGainEnabled
+                                        ? Color.green
+                                        : (isPreActive ? Color.accentColor : Color.secondary)
+                                )
+                        }
+                        .buttonStyle(.plain)
+                        .help("Click to reset Pre-Amp to 0.0 dB")
+                    }
+                    Slider(
+                        value: Binding(
+                            get: { vm.effectiveNetPreampDB },
+                            set: { newVal in
+                                vm.setManualPreampFromSlider(newVal)
+                            }
+                        ),
+                        in: -12.0...12.0,
+                        step: 0.5
+                    )
+                    .controlSize(.small)
+                    .help("Pre-Amp gain (-12.0 dB to +12.0 dB) with soft-knee peak protection")
+                }
+
+                // 4. Auto-Gain (Album True-Peak + Parametric EQ Headroom)
+                HStack(spacing: 6) {
+                    Toggle("Auto-Gain", isOn: $vm.autoGainEnabled)
+                        .toggleStyle(.switch)
+                        .controlSize(.mini)
+                        .font(.caption.weight(.medium))
+                    Spacer()
+                    if let albumPeak = vm.currentAlbumPeakDBFS {
+                        Text(
+                            String(
+                                format: "Album Peak %.1f · EQ %+.1f → %+.1f dB",
+                                albumPeak,
+                                vm.eqHeadroomDeltaDB,
+                                vm.computedAutoGainDB
+                            )
+                        )
+                        .font(.system(size: 9.5, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    } else if vm.isScanningTrackLevel {
+                        Text("Scanning album headroom…")
+                            .font(.system(size: 9.5, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text(String(format: "EQ Offset %+.1f dB (±12 dB)", vm.eqHeadroomDeltaDB))
+                            .font(.system(size: 9.5, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                // 5. Live Stereo Phase Correlation Meter (-1 ... 0 ... +1)
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack {
+                        Text("Binaural Phase Correlation")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text(String(format: "%+.2f", vm.meterCorrelation))
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                    PhaseCorrelationBarView(correlation: vm.meterCorrelation)
+                        .frame(height: 7)
+                }
+            }
+            .frame(width: 295)
+
+            Divider()
+
+            // Right Column: Phase-Locked Parametric EQ + AutoEQ .txt Profile Loader (expands to fill available space)
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    Toggle("Phase-Locked Parametric EQ", isOn: $vm.eqEnabled)
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                        .font(.subheadline.weight(.semibold))
+
+                    Menu {
+                        Section("Built-in Binaural & Headphone Presets") {
+                            ForEach(EQProfile.builtInPresets) { preset in
+                                Button {
+                                    vm.selectEQProfile(preset)
+                                } label: {
+                                    if vm.selectedEQProfileID == preset.id {
+                                        Label(preset.name, systemImage: "checkmark")
+                                    } else {
+                                        Text(preset.name)
+                                    }
+                                }
+                            }
+                        }
+                        if !vm.savedEQProfiles.isEmpty {
+                            Section("Imported .txt Profiles") {
+                                ForEach(vm.savedEQProfiles) { profile in
+                                    Button {
+                                        vm.selectEQProfile(profile)
+                                    } label: {
+                                        if vm.selectedEQProfileID == profile.id {
+                                            Label(profile.name, systemImage: "checkmark")
+                                        } else {
+                                            Text(profile.name)
+                                        }
+                                    }
+                                }
+                                Divider()
+                                Menu("Delete Imported Profile…") {
+                                    ForEach(vm.savedEQProfiles) { profile in
+                                        Button(profile.name, role: .destructive) {
+                                            vm.deleteSavedEQProfile(profile)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } label: {
+                        Label(vm.activeEQProfileName, systemImage: "waveform.path.ecg")
+                            .font(.caption.weight(.medium))
+                    }
+                    .controlSize(.small)
+                    .frame(maxWidth: 215)
+
+                    Button {
+                        vm.pickAndLoadEQProfileTxt()
+                    } label: {
+                        Label("Load .txt…", systemImage: "doc.badge.plus")
+                    }
+                    .controlSize(.small)
+                    .help("Load an AutoEQ, EqualizerAPO, squig.link, or Oratory1990 .txt file (or drop a .txt file onto the window)")
+
+                    Button {
+                        vm.exportCurrentEQProfileTxt()
+                    } label: {
+                        Label("Export .txt…", systemImage: "square.and.arrow.up")
+                    }
+                    .controlSize(.small)
+                    .help("Export current EQ curve to a standard AutoEQ / EqualizerAPO .txt file")
+
+                    Spacer()
+
+                    Button("+ Band") {
+                        vm.addEQBand()
+                    }
+                    .controlSize(.small)
+                    .disabled(vm.eqBands.count >= PlayerConstants.maxEQBands)
+
+                    Button("Flat") {
+                        vm.resetEQFlat()
+                    }
+                    .controlSize(.small)
+                }
+
+                // Frequency Response Curve + Full-Height Scrollable Parametric Bands Table
+                HStack(spacing: 12) {
+                    EQResponseCurveView(
+                        bands: vm.eqBands,
+                        preampDB: vm.effectiveNetPreampDB,
+                        isEnabled: vm.eqEnabled
+                    )
+                    .frame(width: 245)
+                    .frame(maxHeight: .infinity)
+
+                    ScrollView {
+                        VStack(spacing: 5) {
+                            ForEach(Array(vm.eqBands.enumerated()), id: \.element.id) { idx, band in
+                                EQBandRowView(vm: vm, index: idx, band: band)
+                            }
+                        }
+                        .padding(.trailing, 4)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .frame(height: 212)
+        .background(Color.secondary.opacity(0.05))
+    }
+}
+
+struct EQBandRowView: View {
+    @ObservedObject var vm: PlayerViewModel
+    let index: Int
+    let band: EQBand
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Toggle(
+                "",
+                isOn: Binding(
+                    get: { band.isEnabled },
+                    set: { newVal in
+                        guard index < vm.eqBands.count else { return }
+                        vm.eqBands[index].isEnabled = newVal
+                    }
+                )
+            )
+            .labelsHidden()
+            .controlSize(.mini)
+
+            Text("#\(index + 1)")
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .frame(width: 20, alignment: .leading)
+
+            Menu {
+                ForEach(EQFilterType.allCases, id: \.rawValue) { fType in
+                    Button(fType.menuTitle) {
+                        guard index < vm.eqBands.count else { return }
+                        vm.eqBands[index].filterType = fType
+                    }
+                }
+            } label: {
+                Text(band.filterType.shortLabel)
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+            }
+            .controlSize(.mini)
+            .frame(width: 46)
+
+            // Logarithmic Frequency Slider (20 Hz ... 20,000 Hz)
+            Slider(
+                value: Binding(
+                    get: {
+                        let clamped = max(20.0, min(20_000.0, band.frequencyHz))
+                        return log10(clamped / 20.0) / 3.0
+                    },
+                    set: { norm in
+                        guard index < vm.eqBands.count else { return }
+                        let rawHz = 20.0 * pow(1000.0, max(0.0, min(1.0, norm)))
+                        let rounded = rawHz >= 100.0 ? rawHz.rounded() : (rawHz * 10.0).rounded() / 10.0
+                        vm.eqBands[index].frequencyHz = rounded
+                    }
+                ),
+                in: 0.0...1.0
+            )
+            .controlSize(.mini)
+            .frame(minWidth: 70)
+            .help("Center/Cutoff Frequency (20 Hz – 20 kHz)")
+
+            Text(formatHz(band.frequencyHz))
+                .font(.system(size: 10, design: .monospaced))
+                .frame(width: 52, alignment: .trailing)
+
+            if band.filterType.usesGain {
+                Slider(
+                    value: Binding(
+                        get: { band.gainDB },
+                        set: { newGain in
+                            guard index < vm.eqBands.count else { return }
+                            vm.eqBands[index].gainDB = (newGain * 10.0).rounded() / 10.0
+                        }
+                    ),
+                    in: -12.0...12.0
+                )
+                .controlSize(.mini)
+                .frame(minWidth: 68)
+                .help("Band Gain (-12 dB to +12 dB)")
+
+                Text(String(format: "%+.1f dB", band.gainDB))
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(abs(band.gainDB) > 0.05 ? Color.primary : Color.secondary)
+                    .frame(width: 48, alignment: .trailing)
+            } else {
+                Text("— dB")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                    .frame(minWidth: 116, alignment: .trailing)
+            }
+
+            Text("Q")
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundStyle(.secondary)
+
+            Slider(
+                value: Binding(
+                    get: { band.q },
+                    set: { newQ in
+                        guard index < vm.eqBands.count else { return }
+                        vm.eqBands[index].q = (newQ * 20.0).rounded() / 20.0
+                    }
+                ),
+                in: 0.20...10.0
+            )
+            .controlSize(.mini)
+            .frame(width: 52)
+            .help("Filter Q / Bandwidth (0.20 – 10.0)")
+
+            Text(String(format: "%.2f", band.q))
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .frame(width: 32, alignment: .trailing)
+
+            Button {
+                vm.removeEQBand(id: band.id)
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Remove band")
+        }
+    }
+
+    private func formatHz(_ hz: Double) -> String {
+        if hz >= 1000.0 {
+            return String(format: "%.2fk", hz / 1000.0)
+        }
+        return String(format: "%.0f Hz", hz.rounded())
+    }
+}
+
+struct EQResponseCurveView: View {
+    let bands: [EQBand]
+    let preampDB: Double
+    let isEnabled: Bool
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = max(1.0, geo.size.width)
+            let h = max(1.0, geo.size.height)
+            let coeffs = bands.filter(\.isEnabled).map { BiquadCoeffs.make(band: $0) }
+            let midY = h * 0.5
+
+            ZStack {
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(Color.black.opacity(0.22))
+
+                // Grid lines at +6 dB, 0 dB, -6 dB
+                Path { path in
+                    for db in [-6.0, 0.0, 6.0] {
+                        let y = yForDB(db, height: h)
+                        path.move(to: CGPoint(x: 0, y: y))
+                        path.addLine(to: CGPoint(x: w, y: y))
+                    }
+                    // Vertical log-frequency grid lines at 100 Hz, 1 kHz, 10 kHz
+                    for f in [100.0, 1000.0, 10000.0] {
+                        let x = xForFreq(f, width: w)
+                        path.move(to: CGPoint(x: x, y: 0))
+                        path.addLine(to: CGPoint(x: x, y: h))
+                    }
+                }
+                .stroke(Color.secondary.opacity(0.22), lineWidth: 0.75)
+
+                // Filled area under/over 0 dB
+                Path { path in
+                    let steps = 96
+                    path.move(to: CGPoint(x: 0, y: midY))
+                    for i in 0...steps {
+                        let t = Double(i) / Double(steps)
+                        let freq = 20.0 * pow(1000.0, t)
+                        let db = BiquadCoeffs.combinedMagnitudeDB(coeffs: coeffs, atFrequencyHz: freq)
+                        let x = CGFloat(t) * w
+                        let y = yForDB(db, height: h)
+                        path.addLine(to: CGPoint(x: x, y: y))
+                    }
+                    path.addLine(to: CGPoint(x: w, y: midY))
+                    path.closeSubpath()
+                }
+                .fill((isEnabled ? Color.accentColor : Color.secondary).opacity(0.18))
+
+                // Magnitude Response Curve (20 Hz - 20 kHz)
+                Path { path in
+                    let steps = 96
+                    for i in 0...steps {
+                        let t = Double(i) / Double(steps)
+                        let freq = 20.0 * pow(1000.0, t)
+                        let db = BiquadCoeffs.combinedMagnitudeDB(coeffs: coeffs, atFrequencyHz: freq)
+                        let pt = CGPoint(x: CGFloat(t) * w, y: yForDB(db, height: h))
+                        if i == 0 {
+                            path.move(to: pt)
+                        } else {
+                            path.addLine(to: pt)
+                        }
+                    }
+                }
+                .stroke(isEnabled ? Color.accentColor : Color.secondary, lineWidth: 1.8)
+
+                // Frequency & dB Axis Labels
+                VStack {
+                    HStack {
+                        Text("+12 dB")
+                        Spacer()
+                        Text(isEnabled ? "Phase-Locked 64-bit" : "EQ Bypassed")
+                    }
+                    Spacer()
+                    HStack {
+                        Text("20Hz")
+                        Spacer()
+                        Text("100")
+                        Spacer()
+                        Text("1k")
+                        Spacer()
+                        Text("10k")
+                        Spacer()
+                        Text("20k")
+                    }
+                }
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .padding(4)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+        }
+    }
+
+    private func xForFreq(_ freq: Double, width: CGFloat) -> CGFloat {
+        let norm = log10(max(20.0, min(20_000.0, freq)) / 20.0) / 3.0
+        return CGFloat(norm) * width
+    }
+
+    private func yForDB(_ db: Double, height: CGFloat) -> CGFloat {
+        let clamped = max(-14.0, min(14.0, db))
+        let norm = (14.0 - clamped) / 28.0
+        return CGFloat(norm) * height
+    }
+}
+
+struct PhaseCorrelationBarView: View {
+    let correlation: Float
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = max(1.0, geo.size.width)
+            let midX = w * 0.5
+            let clamped = CGFloat(max(-1.0, min(1.0, correlation)))
+            let markerX = midX + clamped * (w * 0.48)
+
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color.secondary.opacity(0.18))
+
+                // Center 0 mark
+                Rectangle()
+                    .fill(Color.secondary.opacity(0.45))
+                    .frame(width: 1, height: geo.size.height)
+                    .position(x: midX, y: geo.size.height * 0.5)
+
+                // Active correlation bar from center to markerX
+                Capsule()
+                    .fill(clamped >= 0 ? Color.green.opacity(0.75) : Color.orange.opacity(0.85))
+                    .frame(width: max(4, abs(markerX - midX)), height: geo.size.height)
+                    .offset(x: min(midX, markerX))
+            }
+        }
     }
 }
 
@@ -4973,39 +6832,16 @@ struct TransportBarView: View {
             }
             .frame(maxWidth: .infinity)
 
-            // Right: Live Post-Preamp Stereo Meter + Pre-Amp (+dB) + Output Volume
+            // Right: Live Post-DSP Stereo Meter + Output Volume
             VStack(alignment: .trailing, spacing: 6) {
-                HStack(spacing: 6) {
-                    StereoMeterView(left: vm.meterLeft, right: vm.meterRight)
-                        .frame(width: 42, height: 14)
-                        .help("Real-time post-preamp stereo headroom meter")
-
-                    Text("Pre")
-                        .font(.system(size: 10, weight: .medium))
+                HStack(spacing: 8) {
+                    Text("L / R")
+                        .font(.system(size: 9, weight: .medium, design: .monospaced))
                         .foregroundStyle(.secondary)
 
-                    Slider(value: $vm.preampDB, in: 0.0...6.0, step: 0.5)
-                        .controlSize(.small)
-                        .frame(width: 86)
-                        .help("Pre-amp boost (0 dB to +6 dB) with soft-clip protection")
-
-                    let isBoosted = vm.preampDB > 0.05
-                    Button {
-                        vm.togglePreampBoost()
-                    } label: {
-                        Text(isBoosted ? String(format: "+%.1f dB", vm.preampDB) : "0.0 dB")
-                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 2)
-                            .frame(width: 54)
-                            .background(
-                                Capsule()
-                                    .fill(isBoosted ? Color.accentColor.opacity(0.18) : Color.secondary.opacity(0.12))
-                            )
-                            .foregroundStyle(isBoosted ? Color.accentColor : Color.secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .help(isBoosted ? "Click to reset pre-amp to 0.0 dB" : "Click for +6.0 dB AC-4 pre-amp boost")
+                    StereoMeterView(left: vm.meterLeft, right: vm.meterRight)
+                        .frame(width: 146, height: 14)
+                        .help("Real-time post-DSP stereo headroom meter")
                 }
 
                 HStack(spacing: 6) {
@@ -5019,7 +6855,7 @@ struct TransportBarView: View {
 
                     Slider(value: $vm.volume, in: 0...1)
                         .controlSize(.small)
-                        .frame(width: 132)
+                        .frame(width: 128)
 
                     Text("\(Int((vm.volume * 100).rounded()))%")
                         .font(.system(size: 10, design: .monospaced))
@@ -5027,7 +6863,7 @@ struct TransportBarView: View {
                         .frame(width: 34, alignment: .trailing)
                 }
             }
-            .frame(width: 242, alignment: .trailing)
+            .frame(width: 220, alignment: .trailing)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
@@ -5086,7 +6922,7 @@ struct AC4PlayerApp: App {
     @StateObject private var viewModel = PlayerViewModel()
 
     var body: some Scene {
-        WindowGroup("AC-4 Player") {
+        WindowGroup("AC-4 Binaural Player") {
             ContentView(vm: viewModel)
         }
         .commands {
@@ -5095,6 +6931,16 @@ struct AC4PlayerApp: App {
                     viewModel.pickAudioFilesOrFolders()
                 }
                 .keyboardShortcut("o", modifiers: [.command])
+
+                Button("Load EQ Profile (.txt)…") {
+                    viewModel.pickAndLoadEQProfileTxt()
+                }
+                .keyboardShortcut("l", modifiers: [.command])
+
+                Button("Export Current EQ Profile (.txt)…") {
+                    viewModel.exportCurrentEQProfileTxt()
+                }
+                .keyboardShortcut("s", modifiers: [.command, .shift])
 
                 Divider()
 
@@ -5116,17 +6962,29 @@ struct AC4PlayerApp: App {
 
                 Divider()
 
+                Button(viewModel.showDSPPanel ? "Hide Binaural & EQ Studio" : "Show Binaural & EQ Studio") {
+                    viewModel.showDSPPanel.toggle()
+                }
+                .keyboardShortcut("d", modifiers: [.command])
+
+                Button(viewModel.autoGainEnabled ? "Disable Auto-Gain" : "Enable Auto-Gain") {
+                    viewModel.autoGainEnabled.toggle()
+                }
+                .keyboardShortcut("g", modifiers: [.command])
+
                 Button("Toggle +6 dB Pre-Amp Boost") {
                     viewModel.togglePreampBoost()
                 }
                 .keyboardShortcut("b", modifiers: [.command])
 
-                Divider()
+                if !viewModel.decoderStatus.isBuiltInNative {
+                    Divider()
 
-                Button("Locate LibreMPEG Binary…") {
-                    viewModel.pickDecoderBinary()
+                    Button("Locate LibreMPEG Binary…") {
+                        viewModel.pickDecoderBinary()
+                    }
+                    .keyboardShortcut(",", modifiers: [.command])
                 }
-                .keyboardShortcut(",", modifiers: [.command])
             }
         }
     }
